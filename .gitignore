@@ -213,3 +213,17 @@ config/*.secret.json
 
 # IDE internal docs
 .trae/
+
+# 运行产物（由 run_all.py / run-daily.sh 生成）
+logs/
+*.log
+.run_all.lock
+.lock/
+
+# 项目记忆（本地私有笔记，勿提交）
+memory/
+.cron.bak
+
+# 凭据备份（含明文 cookie/token，务必勿提交）
+.backup/
+config/token.json.bak.*
