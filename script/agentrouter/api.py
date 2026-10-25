@@ -27,6 +27,7 @@ import os
 import re
 import ssl
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -51,6 +52,10 @@ DEFAULT_USER_AGENT = (
 
 # 换算额度为美元的默认值（站点 /api/status 的 quota_per_unit）
 DEFAULT_QUOTA_PER_UNIT = 500000
+
+# 经代理访问时链路偶发抖动，/api/oauth/state 的有限重试次数与递增间隔（秒）
+OAUTH_STATE_RETRY = 3
+OAUTH_STATE_RETRY_DELAY = 2.0
 
 
 def build_github_cookies(session_value: str = '') -> Dict[str, str]:
@@ -77,6 +82,35 @@ def build_github_cookies(session_value: str = '') -> Dict[str, str]:
 
 def _unescape(text: str) -> str:
     return html.unescape(text or '')
+
+
+def _resolve_proxy(proxy: str = '') -> Optional[Dict[str, str]]:
+    """
+    解析代理配置：显式传入的 proxy 优先，其次读环境变量。
+
+    站点 ps.air-outer.com 前置了阿里云 WAF，机房/云服务器公网 IP 常被直接拦截
+    （返回 200 + WAF 挑战页，正文不是 JSON）。此时必须经代理出口访问。
+
+    取证顺序：proxy 参数 → HTTPS_PROXY → https_proxy → HTTP_PROXY → http_proxy
+    → ALL_PROXY → all_proxy。全部为空则返回 None（直连）。
+
+    Args:
+        proxy (str): 配置中的 proxy 字段，如 http://127.0.0.1:7890
+
+    Returns:
+        Optional[Dict[str, str]]: requests 可直接使用的 proxies 字典，或 None
+    """
+    candidate = (proxy or '').strip()
+    if not candidate:
+        for key in ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy',
+                    'ALL_PROXY', 'all_proxy'):
+            value = (os.environ.get(key) or '').strip()
+            if value:
+                candidate = value
+                break
+    if not candidate:
+        return None
+    return {'http': candidate, 'https': candidate}
 
 
 @lru_cache(maxsize=1)
@@ -143,7 +177,8 @@ class AgentRouterAPI:
         self.user_id = str(user_id or '').strip()
         self.timeout = timeout
         self.verify = verify
-        self.proxies = {'http': proxy, 'https': proxy} if proxy else None
+        # 显式 proxy 优先；未配置时回退到环境变量（HTTP(S)_PROXY / ALL_PROXY）
+        self.proxies = _resolve_proxy(proxy)
         self._client_id: Optional[str] = None
         self._quota_per_unit = DEFAULT_QUOTA_PER_UNIT
 
@@ -219,18 +254,40 @@ class AgentRouterAPI:
         """
         获取登录用 state（服务端会把它写入本次会话）
 
+        经代理访问时链路偶发抖动（连接被重置/超时/WAF 挑战页），这里做有限次重试；
+        该接口是只读的，重试安全。
+
         Returns:
             str: 签名 state
 
         Raises:
             RuntimeError: 接口未返回 state
         """
-        resp = session.get(f'{self.base_url}/api/oauth/state', timeout=self.timeout)
-        body = self._json_of(resp)
-        state = body.get('data')
-        if not body.get('success') or not state:
-            raise RuntimeError(f'获取 oauth state 失败: {body.get("message") or resp.text[:200]}')
-        return str(state)
+        last_error = ''
+        for attempt in range(OAUTH_STATE_RETRY):
+            try:
+                resp = session.get(f'{self.base_url}/api/oauth/state', timeout=self.timeout)
+                if resp.status_code == 429:
+                    # 站点限流：按 Retry-After 等待，避免频繁重试把限流窗口越拉越长
+                    retry_after = resp.headers.get('Retry-After') or ''
+                    try:
+                        wait = max(float(retry_after), OAUTH_STATE_RETRY_DELAY)
+                    except (TypeError, ValueError):
+                        wait = OAUTH_STATE_RETRY_DELAY * (attempt + 1)
+                    last_error = '站点限流 (HTTP 429)，请求过于频繁'
+                    if attempt < OAUTH_STATE_RETRY - 1:
+                        time.sleep(min(wait, 60))
+                    continue
+                body = self._json_of(resp)
+                state = body.get('data')
+                if body.get('success') and state:
+                    return str(state)
+                last_error = body.get('message') or resp.text[:200]
+            except requests.RequestException as exc:
+                last_error = f'{exc.__class__.__name__}: {exc}'
+            if attempt < OAUTH_STATE_RETRY - 1:
+                time.sleep(OAUTH_STATE_RETRY_DELAY * (attempt + 1))
+        raise RuntimeError(f'获取 oauth state 失败: {last_error}')
 
     def _github_session(self) -> requests.Session:
         session = requests.Session()
@@ -316,6 +373,12 @@ class AgentRouterAPI:
         if code:
             return code, '已授权应用，静默换取授权码'
 
+        # 429：GitHub 对未认证/高频请求的限流，不代表登录态失效，必须区分开来
+        if resp.status_code == 429:
+            raise RuntimeError(
+                'GitHub 接口限流 (HTTP 429)，本机或代理出口请求过于频繁，请稍后重试；'
+                '这不是登录态失效，无需重新获取 Cookie')
+
         if resp.status_code in (301, 302, 303):
             location = resp.headers.get('Location') or ''
             if location.startswith(f'{GITHUB_HOST}/login'):
@@ -355,6 +418,12 @@ class AgentRouterAPI:
         """
         完整走一遍 GitHub OAuth 登录（即签到动作）
 
+        关键：state 会话与回调登录**必须复用同一个 session**。
+        /api/oauth/state 会把 state 绑定到本次会话下发的 cookie 上，回调
+        /api/oauth/github 校验 state 依赖该 cookie；若中途换新 session，
+        服务端会返回 success=false（且 message 为空），表现为「登录失败」。
+        GitHub 会话与站点会话相互独立，只携带站点 cookie，不会泄露到 GitHub。
+
         Returns:
             Dict[str, Any]: 含 success/session/mode/user/checked_in 的结果；
                 失败时含 error/error_type
@@ -372,6 +441,7 @@ class AgentRouterAPI:
             code, via = self.authorize_github(state)
             if not code:
                 return {'success': False, 'error': 'GitHub 未返回授权码', 'error_type': 'auth_failed'}
+            # 复用 session（含 state 对应的站点 cookie），不能新建会话
             result = self.login_with_code(session, code, state)
         except Exception as exc:
             return {'success': False, 'error': str(exc), 'error_type': 'auth_failed'}
