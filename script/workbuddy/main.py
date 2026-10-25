@@ -293,6 +293,19 @@ class WorkBuddyTasks:
 
         self._print_summary()
         self._send_notification()
+        return self._exit_code()
+
+    def _exit_code(self) -> int:
+        """
+        计算进程退出码：存在签到失败的账号时返回 1
+
+        供统一入口 run_all.py 判断本平台是否成功（脚本本身失败仍会推送通知，
+        但退出码是给调度器/CI 用的机器可读信号）。今日已签到不算失败。
+        """
+        if not self.account_results:
+            return 0
+        failed = [r for r in self.account_results if not r.get('success')]
+        return 1 if failed else 0
 
     def _print_summary(self):
         """打印执行结果统计"""
@@ -353,12 +366,12 @@ class WorkBuddyTasks:
         content = "\n".join(content_lines)
 
         try:
-            send_notification(
+            sent = send_notification(
                 title=title,
                 content=content,
                 sound=NotificationSound.BIRDSONG
             )
-            self.logger.info("✅ 推送通知已发送")
+            self.logger.info("✅ 推送通知已发送" if sent else "ℹ️ 子通知已静默（由统一入口汇总推送）")
         except Exception as e:
             self.logger.warning(f"⚠️ 发送推送通知失败: {str(e)}")
 
@@ -367,7 +380,7 @@ def main():
     """主函数"""
     try:
         tasks = WorkBuddyTasks()
-        tasks.run()
+        exit_code = tasks.run()
 
     except FileNotFoundError as e:
         print(f"❌ 错误: {e}")
@@ -378,6 +391,8 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+    sys.exit(exit_code or 0)
 
 
 if __name__ == "__main__":

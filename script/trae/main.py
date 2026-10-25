@@ -468,6 +468,18 @@ class TraeTasks:
         self._print_summary()
         if not dry_run:
             self._send_notification()
+        return self._exit_code()
+
+    def _exit_code(self) -> int:
+        """
+        计算进程退出码：存在签到失败的账号时返回 1
+
+        供统一入口 run_all.py 判断本平台是否成功。签到成功、今日已签、
+        重复配置条目都不算失败，只有真正失败的账号才置非 0。
+        """
+        if not self.account_results:
+            return 0
+        return 1 if self._stats()['failed'] > 0 else 0
 
     def _stats(self) -> Dict[str, int]:
         """汇总各分类计数（重复配置条目单独统计，不计入签到成功/失败）"""
@@ -554,12 +566,12 @@ class TraeTasks:
         content = "\n".join(content_lines)
 
         try:
-            send_notification(
+            sent = send_notification(
                 title=title,
                 content=content,
                 sound=NotificationSound.BIRDSONG
             )
-            self.logger.info("✅ 推送通知已发送")
+            self.logger.info("✅ 推送通知已发送" if sent else "ℹ️ 子通知已静默（由统一入口汇总推送）")
         except Exception as e:
             self.logger.warning(f"⚠️ 发送推送通知失败: {str(e)}")
 
@@ -569,7 +581,7 @@ def main():
     dry_run = '--dry-run' in sys.argv
     try:
         tasks = TraeTasks()
-        tasks.run(dry_run=dry_run)
+        exit_code = tasks.run(dry_run=dry_run)
 
     except FileNotFoundError as e:
         print(f"❌ 错误: {e}")
@@ -580,6 +592,8 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+    sys.exit(exit_code or 0)
 
 
 if __name__ == "__main__":

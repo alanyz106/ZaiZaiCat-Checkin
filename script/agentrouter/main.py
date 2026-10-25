@@ -146,6 +146,10 @@ class AgentRouterTasks:
 
         api = self._build_api(account_info)
         self.logger.info(f'{account_name} - 站点: {api.base_url}')
+        if api.proxies:
+            self.logger.info(f"{account_name} - 代理: {api.proxies['https']}")
+        else:
+            self.logger.info(f'{account_name} - 代理: 未配置（直连）')
 
         # 登录即签到：重走一次 GitHub OAuth 登录，服务端在登录流程中发放额度
         self.logger.info(f'{account_name} - 通过 GitHub OAuth 重新登录以触发签到')
@@ -180,7 +184,7 @@ class AgentRouterTasks:
         """执行所有账号的签到"""
         if not self.accounts:
             self.logger.error('没有可处理的账号，请检查配置')
-            return
+            return 0
 
         if dry_run:
             self.logger.info('[dry-run] 仅校验配置，不执行登录')
@@ -188,7 +192,7 @@ class AgentRouterTasks:
                 name = account.get('account_name') or f'账号{index + 1}'
                 has_github = bool(account.get('github_session'))
                 self.logger.info(f'{name}: GitHub登录态={has_github}')
-            return
+            return 0
 
         for index, account in enumerate(self.accounts):
             self.account_results.append(self.process_account(index, account))
@@ -196,6 +200,17 @@ class AgentRouterTasks:
                 time.sleep(ACCOUNT_INTERVAL_SECONDS)
 
         self._send_notification()
+        return self._exit_code()
+
+    def _exit_code(self) -> int:
+        """
+        计算进程退出码：存在签到失败的账号时返回 1
+
+        供统一入口 run_all.py 判断本平台是否成功（推送通知走人，退出码走机器）。
+        """
+        if not self.account_results:
+            return 0
+        return 1 if any(not r.get('success') for r in self.account_results) else 0
 
     def _send_notification(self):
         """汇总并发送推送通知"""
@@ -222,12 +237,12 @@ class AgentRouterTasks:
                 lines.append(f"    💰 当前余额: ${result['quota_usd']}")
 
         try:
-            send_notification(
+            sent = send_notification(
                 title='AgentRouter签到结果通知',
                 content='\n'.join(lines),
                 sound=NotificationSound.BIRDSONG,
             )
-            self.logger.info('✅ 推送通知已发送')
+            self.logger.info('✅ 推送通知已发送' if sent else 'ℹ️ 子通知已静默（由统一入口汇总推送）')
         except Exception as exc:
             self.logger.warning(f'⚠️ 发送推送通知失败: {exc}')
 
@@ -235,7 +250,7 @@ class AgentRouterTasks:
 def main():
     dry_run = '--dry-run' in sys.argv
     try:
-        AgentRouterTasks().run(dry_run=dry_run)
+        exit_code = AgentRouterTasks().run(dry_run=dry_run)
     except (FileNotFoundError, ValueError) as exc:
         print(f'❌ 错误: {exc}')
         sys.exit(1)
@@ -244,6 +259,7 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    sys.exit(exit_code or 0)
 
 
 if __name__ == '__main__':
