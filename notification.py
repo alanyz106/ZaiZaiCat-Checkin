@@ -98,6 +98,27 @@ class NotificationSound:
     UPDATE = "update"
 
 
+def _split_values(value: Any) -> list:
+    """
+    把配置值统一拆成列表
+
+    支持三种写法：
+    - "a,b,c"（逗号分隔字符串，可带空格）
+    - ["a", "b"]
+    - "" 或 None → []
+
+    Returns:
+        list: 去空白、去空项后的字符串列表
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = str(value).replace('，', ',').split(',')
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
 class NotificationManager:
     """青龙面板通知推送管理器"""
 
@@ -118,6 +139,7 @@ class NotificationManager:
         self.gotify_config = self._load_gotify_config()
         self.ntfy_config = self._load_ntfy_config()
         self.pushdeer_config = self._load_pushdeer_config()
+        self.wxpusher_config = self._load_wxpusher_config()
 
     def _load_config_from_file(self) -> Dict:
         """从JSON文件中加载配置"""
@@ -258,6 +280,20 @@ class NotificationManager:
             'type': self._get_config_value('pushdeer', 'type', 'PUSHDEER_TYPE', 'text'),
         }
 
+    def _load_wxpusher_config(self) -> Dict[str, Any]:
+        """加载WxPusher配置（appToken + 推送目标）"""
+        uids_raw = self._get_config_value('wxpusher', 'uids', 'WXPUSHER_UIDS', '')
+        topics_raw = self._get_config_value('wxpusher', 'topic_ids', 'WXPUSHER_TOPIC_IDS', '')
+        return {
+            'app_token': self._get_config_value('wxpusher', 'app_token', 'WXPUSHER_APP_TOKEN', ''),
+            # 同时兼容字符串（逗号分隔）与列表两种写法，统一成列表
+            'uids': _split_values(uids_raw),
+            'topic_ids': [int(t) for t in _split_values(topics_raw) if str(t).lstrip('-').isdigit()],
+            'url': self._get_config_value(
+                'wxpusher', 'url', 'WXPUSHER_URL',
+                'https://wxpusher.zjiecode.com/api/send/message'),
+        }
+
     def is_bark_enabled(self) -> bool:
         """检查Bark推送是否已启用"""
         return bool(self.bark_config.get('push'))
@@ -315,6 +351,13 @@ class NotificationManager:
         """检查PushDeer推送是否已启用"""
         return bool(self.pushdeer_config.get('pushkey'))
 
+    def is_wxpusher_enabled(self) -> bool:
+        """检查WxPusher推送是否已启用（需要 appToken 且至少一个 uid 或 topicId）"""
+        return bool(
+            self.wxpusher_config.get('app_token')
+            and (self.wxpusher_config.get('uids') or self.wxpusher_config.get('topic_ids'))
+        )
+
     def send(self, title: str, content: str, level: Optional[str] = None,
              sound: Optional[str] = None, group: Optional[str] = None,
              url: Optional[str] = None, timeout: int = 10):
@@ -356,6 +399,8 @@ class NotificationManager:
             self.send_gotify_notification(title, content, timeout)
         if self.is_ntfy_enabled():
             self.send_ntfy_notification(title, content, timeout)
+        if self.is_wxpusher_enabled():
+            self.send_wxpusher_notification(title, content, timeout)
 
     def send_server_notification(self, title: str, content: str, timeout: int = 10) -> bool:
         """发送Server酱推送"""
@@ -812,6 +857,48 @@ class NotificationManager:
             self.logger.error(f"❌ PushDeer 推送异常: {e}")
             return False
 
+    def send_wxpusher_notification(self, title: str, content: str, timeout: int = 10) -> bool:
+        """
+        发送WxPusher推送
+
+        接口：POST https://wxpusher.zjiecode.com/api/send/message
+        contentType=1 纯文本、2 HTML、3 Markdown。这里用 1（纯文本），
+        避免各平台脚本输出的日志/特殊字符被当成 HTML 解析。
+
+        Returns:
+            bool: code == 1000 视为发送成功
+        """
+        if not self.is_wxpusher_enabled():
+            self.logger.warning("WxPusher推送未启用")
+            return False
+
+        payload: Dict[str, Any] = {
+            "appToken": self.wxpusher_config['app_token'],
+            "content": content,
+            "summary": title,          # 消息摘要，正文过长时用于列表展示
+            "contentType": 1,          # 1=纯文本
+            "uids": self.wxpusher_config.get('uids') or [],
+            "topicIds": self.wxpusher_config.get('topic_ids') or [],
+        }
+        url = self.wxpusher_config['url']
+
+        try:
+            self.logger.info("正在发送WxPusher推送")
+            response = requests.post(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+            result = response.json()
+            if result.get('code') == 1000:
+                self.logger.info("✅ WxPusher推送成功")
+                return True
+            self.logger.error(f"❌ WxPusher推送失败: {result.get('msg') or response.text}")
+            return False
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ WxPusher推送请求异常: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ WxPusher推送异常: {e}")
+            return False
+
 
 # 创建全局通知管理器实例
 notification_manager = NotificationManager()
@@ -823,6 +910,10 @@ def send_notification(title: str, content: str, level: Optional[str] = None,
     """
     便捷函数：发送通知
 
+    环境变量 CHECKIN_NOTIFY_SILENT=1 时跳过发送。
+    统一入口 run_all.py 会为子脚本设置该变量，避免每个平台各推一条、
+    最后由 run_all.py 统一汇总成一条。
+
     Args:
         title (str): 推送标题
         content (str): 推送内容
@@ -831,7 +922,12 @@ def send_notification(title: str, content: str, level: Optional[str] = None,
         group (Optional[str]): 推送分组 (Bark专用)
         url (Optional[str]): 跳转链接 (Bark专用)
     """
+    if os.environ.get('CHECKIN_NOTIFY_SILENT', '').strip() in ('1', 'true', 'yes'):
+        logging.getLogger("NotificationManager").info(
+            f"CHECKIN_NOTIFY_SILENT 已开启，跳过子脚本推送（由 run_all.py 统一汇总）：{title}")
+        return False
     notification_manager.send(title, content, level=level, sound=sound, group=group, url=url)
+    return True
 
 
 if __name__ == "__main__":
