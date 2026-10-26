@@ -80,15 +80,21 @@ class SmzdmService:
         win_coupon_list = exchange_info.get('win_coupon_list', [])
 
         if win_coupon_list:
-            logger.info(f"\n  🎫 可兑换必中券列表:")
-            for coupon in win_coupon_list:
-                coupon_name = coupon.get('article_title', '未知')
-                coupon_energy = coupon.get('article_energy_total', 0)
-                coupon_desc = coupon.get('article_subtitle', '')
-
-                # 判断能量值是否足够兑换
-                can_exchange = "✅" if my_energy_total >= coupon_energy else "❌"
-                logger.info(f"    {can_exchange} {coupon_name} - 需要{coupon_energy}能量值 ({coupon_desc})")
+            # 只打印「够得着」的券，或最近一张的最低门槛。
+            # 全部逐条打印会产生 4 行 ❌（1350/7200/18000/30000 能量值），
+            # 而实际签到每天只加 2~10 能量，天天刷这四行纯属噪音。
+            affordable = [c for c in win_coupon_list
+                          if my_energy_total >= c.get('article_energy_total', 0)]
+            if affordable:
+                logger.info(f"\n  🎫 可兑换必中券（{len(affordable)}/{len(win_coupon_list)} 张已达标）:")
+                for coupon in affordable:
+                    logger.info(f"    ✅ {coupon.get('article_title', '未知')} "
+                                f"- 需要{coupon.get('article_energy_total', 0)}能量值")
+            else:
+                cheapest = min(win_coupon_list, key=lambda c: c.get('article_energy_total', 0))
+                need = cheapest.get('article_energy_total', 0)
+                logger.info(f"\n  🎫 必中券: 暂无达标（最低 {need} 能量值，"
+                            f"当前 {my_energy_total}，还差 {max(need - my_energy_total, 0)}）")
 
     # ==================== 众测任务业务逻辑 ====================
 
@@ -489,11 +495,14 @@ class SmzdmService:
 
 
         # 账户余额信息
+        # 注意：新版账户体系只有「金币 / 碎银子 / 经验」，
+        # 旧的 cpoints（积分）字段服务端恒返回 0，且个人中心已无「积分」一项，
+        # 因此不再打印，避免每天输出一个误导性的「当前积分: 0」。
         logger.info(f"\n  💰 账户余额:")
-        logger.info(f"    • 当前积分: {cpoints}")
         logger.info(f"    • 当前金币: {cgold}")
         logger.info(f"    • 当前经验: {cexperience}")
         logger.info(f"    • 声望值: {cprestige}")
+        logger.info(f"    • 本次签到获得积分: {cpadd}（新版体系已基本停发积分，常为 0）")
 
         # 抽奖信息
         if lottery_type:

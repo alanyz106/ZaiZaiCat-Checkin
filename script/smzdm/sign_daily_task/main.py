@@ -588,18 +588,30 @@ class SmzdmTaskManager:
                             content_parts.append(f"   📅 签到: 连续{days}天")
                         else:
                             content_parts.append(f"   📅 签到: 成功")
+                        # 账户余额：只展示新版体系真实存在的三项。
+                        # 旧的「积分(cpoints)」已废弃恒为 0，展示出来纯属误导，故不显示。
+                        gold = checkin.get('gold', '0')
+                        silver = checkin.get('silver', '0')
+                        exp = checkin.get('experience', '0')
+                        content_parts.append(f"   💰 金币{gold} · 碎银子{silver} · 经验{exp}")
 
-                    # 众测任务统计
+                    # 众测任务统计。失败项多为活动已下架，不必逐条推送
                     z_success = zhongce.get('success', 0)
                     z_fail = zhongce.get('fail', 0)
                     z_skip = zhongce.get('skip', 0)
-                    content_parts.append(f"   🎯 众测: ✅{z_success} ⚠️{z_fail} ⏭️{z_skip}")
+                    line = f"   🎯 众测: ✅{z_success} ⏭️{z_skip}"
+                    if z_fail:
+                        line += f" ⚠️{z_fail}(活动已下架)"
+                    content_parts.append(line)
 
-                    # 互动任务统计
+                    # 互动任务统计。失败项多为接口风控(403)，同样只给数字
                     i_success = interactive.get('success', 0)
                     i_fail = interactive.get('fail', 0)
                     i_skip = interactive.get('skip', 0)
-                    content_parts.append(f"   🎯 互动: ✅{i_success} ⚠️{i_fail} ⏭️{i_skip}")
+                    line = f"   🎯 互动: ✅{i_success} ⏭️{i_skip}"
+                    if i_fail:
+                        line += f" ⚠️{i_fail}(接口风控)"
+                    content_parts.append(line)
 
                 # 账号之间添加空行
                 if i < len(self.account_results):
@@ -673,9 +685,18 @@ class SmzdmTaskManager:
             if checkin_data:
                 service.print_checkin_info(checkin_data)
                 result['checkin']['success'] = True
-                # 提取连续签到天数
-                if checkin_data.get('data'):
-                    result['checkin']['continuous_days'] = checkin_data['data'].get('continue_checkin_days', 0)
+                # 连续签到天数：真实字段是 data.daily_num（2026-10-26 实测），
+                # 上游读的 continue_checkin_days 在响应里不存在，永远是 0。
+                data = checkin_data.get('data') or {}
+                days = data.get('daily_num') or data.get('continue_checkin_days') or 0
+                result['checkin']['continuous_days'] = int(days or 0)
+                # 新版账户体系以「金币 / 碎银子 / 经验」计量，旧「积分(cpoints)」已废弃
+                # （个人中心只显示这三项，积分日志页为「暂无积分记录」）。
+                # 保存下来供推送摘要使用，避免再展示恒为 0 的「积分」。
+                result['checkin']['gold'] = data.get('cgold', '0')
+                result['checkin']['silver'] = data.get('silver', data.get('csilver', '0'))
+                result['checkin']['experience'] = data.get('cexperience', '0')
+                result['checkin']['points_added'] = data.get('cpadd', '0')
             else:
                 logger.warning("⚠️  每日签到失败或已签到")
 
