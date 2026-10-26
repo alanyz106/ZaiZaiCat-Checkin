@@ -254,3 +254,6 @@ vendor/
 
 # 本地 AI 协作文档（含服务器路径与私有记忆引用，勿提交）
 AGENTS.md
+
+# playwright-cli 浏览器调试产物（快照/截图/控制台日志，可能含登录后页面内容）
+.playwright-cli/
