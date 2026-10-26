@@ -58,6 +58,9 @@ class Platform:
     supports_dry_run: bool = False
     # 单个平台超时（秒）。脚本内置随机延迟已关掉，留足网络重试余量即可
     timeout: int = 900
+    # 该平台在汇总通知里保留几行摘要。信息密度高的平台（如 smzdm
+    # 有签到/余额/能量值/任务统计多项）可调大
+    highlights: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +133,8 @@ PLATFORMS: List[Platform] = [
         name="什么值得买",
         script="script/smzdm/sign_daily_task/main.py",
         config_node="smzdm",
+        # 签到 / 余额 / 能量值 / 必中券 / 众测 / 互动，信息密度高
+        highlights=6,
     ),
 ]
 
@@ -273,7 +278,7 @@ def run_platform(platform: Platform, dry_run: bool, keep_jitter: bool,
               f"（{result['duration']:.1f}s）{result['detail']}\n")
 
     # 从子进程输出中提取关键行，供汇总通知使用
-    result["highlights"] = extract_highlights(result.pop("output", ""))
+    result["highlights"] = extract_highlights(result.pop("output", ""), limit=platform.highlights)
     return result
 
 
@@ -282,11 +287,20 @@ def run_platform(platform: Platform, dry_run: bool, keep_jitter: bool,
 HIGHLIGHT_KEYWORDS = (
     "签到成功", "今日已签到", "已签到", "获得积分", "奖励积分", "连签", "积分",
     "余额", "凭证", "令牌", "失效", "失败", "过期", "错误", "❌", "⚠️", "🎁",
+    # 什么值得买：能量值与必中券是攒实物奖品的唯一路径，必须推送
+    "能量", "必中券", "金币", "碎银子", "经验",
+)
+# 这些关键词所在的行优先占推送名额（数值型、结论型信息）
+HIGHLIGHT_PRIORITY = (
+    "能量", "必中券", "金币", "碎银子", "余额", "签到成功", "今日已签到",
+    "连签", "失效", "过期",
 )
 # 这些行属于噪音，不值得推送
 HIGHLIGHT_EXCLUDE = (
     "=====", "开始处理账号", "执行结果统计", "状态正常", "查询签到状态",
     "通过 GitHub OAuth", "站点:", "代理:", "成功加载", "RSA", "公钥",
+    # 过程性日志：只是"正在获取/成功获取"，没有信息量
+    "正在获取", "成功获取", "开始执行", "正在执行", "开始处理",
 )
 
 
@@ -303,7 +317,23 @@ def extract_highlights(output: str, limit: int = 4) -> List[str]:
     """
     if not output:
         return []
-    picked: List[str] = []
+
+    def _clean(raw: str) -> str:
+        """去掉日志前缀，返回纯内容"""
+        line = raw.strip()
+        m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - (?:[\w.]+ - )?[A-Z]+ - (.*)$", line)
+        if m:
+            return m.group(1).strip()
+        # smzdm 等脚本用 "时间 | LEVEL | 内容" 的格式
+        m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| \w+\s*\| (.*)$", line)
+        if m:
+            return m.group(1).strip()
+        return line
+
+    # 按优先级分档收集：高优先级的行先占名额，避免被前面的噪音挤掉。
+    # 例：smzdm 的「能量值」出现在日志很靠后，若单纯按顺序截断就会丢失，
+    # 而这恰恰是用户最关心的信息。
+    tiers: List[List[str]] = [[], [], []]
     seen = set()
     for raw in output.splitlines():
         line = raw.strip()
@@ -311,20 +341,31 @@ def extract_highlights(output: str, limit: int = 4) -> List[str]:
             continue
         if not any(k in line for k in HIGHLIGHT_KEYWORDS):
             continue
-        # 去掉日志前缀："2026-10-25 16:44:23 - __main__ - INFO - xxx" 或
-        # "2026-10-25 16:44:23 - ERROR - xxx"（无 logger 名）
-        m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - (?:[\w.]+ - )?[A-Z]+ - (.*)$", line)
-        if m:
-            line = m.group(1).strip()
+        line = _clean(line)
         # 跳过纯统计数字行（由汇总自己算）
         if line.startswith(("总账号数:", "签到成功:", "签到失败:", "今日已签:")):
             continue
-        if line in seen:
+        # 跳过只有标题没有数值的行（如「💰 账户余额:」）
+        if line.endswith((":", "：")):
             continue
-        seen.add(line)
-        picked.append(line[:80])
-        if len(picked) >= limit:
-            break
+        # 去掉开头的项目符号/emoji，做「语义去重」：
+        # "✅ 每日签到成功!" 与 "📅 签到成功!" 内容重复，只留前者
+        key = re.sub(r"^[^\w\u4e00-\u9fff]+", "", line)
+        key = key.replace("每日", "").replace("当前", "").strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        tier = 0 if any(k in line for k in HIGHLIGHT_PRIORITY) else 1
+        # 去掉行首项目符号「• 」等，推送里显得干净
+        line = re.sub(r"^[•·\-]\s*", "", line)
+        tiers[tier].append(line[:80])
+
+    picked: List[str] = []
+    for tier in tiers:
+        for line in tier:
+            if len(picked) >= limit:
+                return picked
+            picked.append(line)
     return picked
 
 

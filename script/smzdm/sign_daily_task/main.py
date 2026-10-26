@@ -186,21 +186,33 @@ class SmzdmTaskManager:
             service = SmzdmService(api)
 
             # 获取用户能量值信息
+            energy_info = {}
             user_data = api.get_user_energy_info()
             if user_data:
                 service.print_energy_info(user_data)
+                me = (user_data.get('my_energy') or {})
+                energy_info = {
+                    'total': me.get('my_energy_total', 0),
+                    'coupons': me.get('win_conpou_total', 0),
+                }
+                # 顺带算出「最近一张必中券还差多少能量」，供推送摘要使用
+                coupons = ((user_data.get('exchange_win_coupon') or {})
+                           .get('win_coupon_list') or [])
+                if coupons:
+                    cheapest = min(coupons, key=lambda c: c.get('article_energy_total', 0))
+                    energy_info['cheapest_need'] = cheapest.get('article_energy_total', 0)
 
             # 获取活动ID
             activity_id = api.get_activity_id()
             if not activity_id:
                 logger.error(f"❌ 获取众测活动ID失败")
-                return {'success': 0, 'fail': 0, 'skip': 0}
+                return {'success': 0, 'fail': 0, 'skip': 0, 'energy': energy_info}
 
             # 获取任务列表
             tasks = api.get_task_list(activity_id)
             if not tasks:
                 logger.error(f"❌ 获取众测任务列表失败")
-                return {'success': 0, 'fail': 0, 'skip': 0}
+                return {'success': 0, 'fail': 0, 'skip': 0, 'energy': energy_info}
 
             # 打印任务信息
             logger.info(f"📊 众测任务列表 (共 {len(tasks)} 个):")
@@ -248,11 +260,12 @@ class SmzdmTaskManager:
             logger.info(f"💰 检查并领取众测任务奖励...")
             self.claim_task_rewards(api, activity_id)
 
-            return {'success': success_count, 'fail': fail_count, 'skip': skip_count}
+            return {'success': success_count, 'fail': fail_count, 'skip': skip_count,
+                    'energy': energy_info}
 
         except Exception as e:
             logger.error(f"❌ 处理众测任务时发生错误: {str(e)}", exc_info=True)
-            return {'success': 0, 'fail': 0, 'skip': 0}
+            return {'success': 0, 'fail': 0, 'skip': 0, 'energy': {}}
 
     def process_interactive_tasks(self, api: SmzdmAPI, account_name: str) -> Dict[str, int]:
         """
@@ -594,6 +607,16 @@ class SmzdmTaskManager:
                         silver = checkin.get('silver', '0')
                         exp = checkin.get('experience', '0')
                         content_parts.append(f"   💰 金币{gold} · 碎银子{silver} · 经验{exp}")
+
+                    # 能量值与必中券：这是攒实物奖品的唯一路径，必须出现在摘要里
+                    energy = zhongce.get('energy') or {}
+                    if energy.get('total') is not None:
+                        line = f"   💎 能量值 {energy.get('total', 0)} · 必中券 {energy.get('coupons', 0)} 张"
+                        need = energy.get('cheapest_need')
+                        if need and not energy.get('coupons'):
+                            gap = max(int(need) - int(energy.get('total') or 0), 0)
+                            line += f"（最近门槛 {need}，还差 {gap}）"
+                        content_parts.append(line)
 
                     # 众测任务统计。失败项多为活动已下架，不必逐条推送
                     z_success = zhongce.get('success', 0)

@@ -502,7 +502,7 @@ class SmzdmService:
         logger.info(f"    • 当前金币: {cgold}")
         logger.info(f"    • 当前经验: {cexperience}")
         logger.info(f"    • 声望值: {cprestige}")
-        logger.info(f"    • 本次签到获得积分: {cpadd}（新版体系已基本停发积分，常为 0）")
+        # 注：cpadd（本次获得积分）新版体系恒为 0，不再展示。
 
         # 抽奖信息
         if lottery_type:
