@@ -114,6 +114,23 @@ PLATFORMS: List[Platform] = [
         script="script/huaruntong/ole/main.py",
         config_node="huaruntong.ole",
     ),
+    # ------------------------------------------------------------------
+    # 什么值得买（2026-10-26 接入）
+    #
+    # 凭证只有一个全量 Cookie（浏览器 F12 复制），寿命数月，无需续期。
+    # 脚本内含纯 Python 实现的请求签名（sign_calculator.py），无需额外依赖；
+    # 但 api.py 顶部 import Pillow（处理图片压缩），已装在 vendor/。
+    #
+    # 签到走 user-api.smzdm.com/checkin，成功返回 error_code="0"。
+    # 众测/互动任务常有个别失败（文章已下架、达人关注接口 403），
+    # 属上游脚本对接口变动适配不足，不影响签到本身。
+    # ------------------------------------------------------------------
+    Platform(
+        key="smzdm",
+        name="什么值得买",
+        script="script/smzdm/sign_daily_task/main.py",
+        config_node="smzdm",
+    ),
 ]
 
 PLATFORM_MAP = {p.key: p for p in PLATFORMS}

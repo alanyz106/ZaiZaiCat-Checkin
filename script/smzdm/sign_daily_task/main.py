@@ -33,6 +33,11 @@ if project_root not in sys.path:
 if smzdm_dir not in sys.path:
     sys.path.insert(0, smzdm_dir)
 
+# Pillow 等可选依赖装在项目内 vendor/（系统 site-packages 只读，pip 装不进去）
+_vendor = os.path.join(project_root, "vendor")
+if os.path.isdir(_vendor) and _vendor not in sys.path:
+    sys.path.insert(0, _vendor)
+
 from api.api import SmzdmAPI
 from service import SmzdmService
 
@@ -58,7 +63,11 @@ def setup_logger():
     )
 
     # 文件处理器 - 详细日志
-    file_handler = logging.FileHandler('../smzdm_task.log', encoding='utf-8', mode='a')
+    # 注意：原为 '../smzdm_task.log'（相对 CWD）。run_all.py 以项目根为 CWD 调用时
+    # 会解析成 /root/smzdm_task.log，在只读根盘上直接抛 Errno 30。改用绝对路径。
+    log_dir = Path(__file__).resolve().parent
+    log_path = log_dir / "smzdm_task.log"
+    file_handler = logging.FileHandler(str(log_path), encoding='utf-8', mode='a')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(log_formatter)
 
