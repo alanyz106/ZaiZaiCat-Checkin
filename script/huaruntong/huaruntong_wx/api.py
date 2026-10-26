@@ -7,11 +7,27 @@ import hmac
 import hashlib
 import base64
 import os
-import requests
+import sys
+import uuid
+from pathlib import Path
 from urllib.parse import quote
-from Crypto.Cipher import AES
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
+
+import requests
+
+# pycryptodome 不是本机默认安装的（系统 Python 只有 requests）。
+# 优先用系统 site-packages，缺失时回落到项目自带的 vendor/ 目录，
+# 这样 run_all.py 调用与直接 python3 main.py 单跑都能 import 成功。
+try:
+    from Crypto.Cipher import AES
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import PKCS1_OAEP
+except ImportError:  # pragma: no cover - 依赖缺失时的兜底
+    _vendor = Path(__file__).resolve().parents[3] / "vendor"
+    if _vendor.is_dir():
+        sys.path.insert(0, str(_vendor))
+    from Crypto.Cipher import AES
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import PKCS1_OAEP
 
 
 class HuaRunTongAPI:
@@ -31,7 +47,8 @@ rk312EDfBHtRgDvB0QIDAQAB
     def __init__(self, token: str, answer_result: int = 1, channel_id: str = "APP",
                  merchant_code: str = "1641000001532", store_code: str = "qiandaosonjifen",
                  sys_id: str = "T0000001", transaction_uuid: str = "",
-                 invite_code: str = "", user_agent: str = None):
+                 invite_code: str = "", user_agent: str = None,
+                 timeout: int = 20):
         """
         初始化华润通API
 
@@ -41,9 +58,10 @@ rk312EDfBHtRgDvB0QIDAQAB
         :param merchant_code: 商户编码
         :param store_code: 门店编码
         :param sys_id: 系统ID
-        :param transaction_uuid: 交易UUID
+        :param transaction_uuid: 交易UUID（已废弃：接口要求逐请求随机，内部会覆盖）
         :param invite_code: 邀请码
         :param user_agent: 用户代理字符串
+        :param timeout: 单次请求超时（秒）
         """
         self.token = token
         self.answer_result = answer_result
@@ -53,6 +71,7 @@ rk312EDfBHtRgDvB0QIDAQAB
         self.sys_id = sys_id
         self.transaction_uuid = transaction_uuid
         self.invite_code = invite_code
+        self.timeout = timeout
         self.user_agent = user_agent or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
     def _generate_aes_key(self):
@@ -123,7 +142,8 @@ rk312EDfBHtRgDvB0QIDAQAB
         encrypted = self._crypto_data(payload.copy(), api_path)
 
         try:
-            resp = requests.post(url, json=encrypted, headers=self._get_headers())
+            resp = requests.post(url, json=encrypted, headers=self._get_headers(),
+                                 timeout=self.timeout)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:
@@ -138,17 +158,34 @@ rk312EDfBHtRgDvB0QIDAQAB
 
         :return: 响应数据
         """
+        # transactionUuid 是**逐请求随机**的 UUIDv4（抓包确认每次都不同），
+        # 配置里的值必定已过期，所以始终现场生成；留空与否都不影响。
         payload = {
             "answerResult": self.answer_result,
             "channelId": self.channel_id,
             "merchantCode": self.merchant_code,
             "storeCode": self.store_code,
             "sysId": self.sys_id,
-            "transactionUuid": self.transaction_uuid,
+            "transactionUuid": str(uuid.uuid4()),
             "inviteCode": self.invite_code,
             "token": self.token
         }
 
         api_path = "/api/points/saveQuestionSignin"
         return self._send_request(api_path, payload)
+
+    def query_summary(self) -> dict:
+        """
+        查询积分汇总（只读，用于余额展示）
+
+        :return: 响应数据，data.data.cPoints 内含 points/availablePoints
+        """
+        payload = {
+            "channelId": self.channel_id,
+            "sysId": self.sys_id,
+            "transactionUuid": str(uuid.uuid4()),
+            "token": self.token,
+        }
+        return self._send_request("/api/points/querySummary", payload)
+
 

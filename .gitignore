@@ -225,5 +225,32 @@ memory/
 .cron.bak
 
 # 凭据备份（含明文 cookie/token，务必勿提交）
+# ⚠️ 2026-10-26 修正：原规则只写了 `config/token.json.bak.*`（点分隔），
+# 而实际备份文件名是 `config/token.json.bak-YYYYmmdd-HHMMSS`（连字符），
+# 导致两个含明文 sessionid/access_token/refresh_token/github_session 的备份
+# 一直处于「未跟踪但未忽略」状态，差点被 commit 推上公开仓库。
 .backup/
-config/token.json.bak.*
+config/token.json.bak*
+config/*.json.bak*
+*.bak
+*.bak-*
+*.bak.*
+
+# Trae CN relay 部署目录（含 API key 与账号凭证，勿提交）
+trae-relay/.apikey
+trae-relay/.env
+trae-relay/data/
+trae-relay/.jwt.tmp
+trae-relay/.jwt.tmp
+
+# Qoder 调研产物（含 token / state，勿提交）
+script/qoder/.qoder-credentials.json
+script/qoder/.qoder-device-state.json
+script/qoder/__pycache__/
+.qoderhome/
+
+# 本地第三方依赖（pycryptodome 装在项目内 vendor/，系统 Python 无 sudo 可写目录）
+vendor/
+
+# 本地 AI 协作文档（含服务器路径与私有记忆引用，勿提交）
+AGENTS.md

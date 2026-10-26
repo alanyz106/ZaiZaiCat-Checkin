@@ -52,11 +52,12 @@ def process_account(account_config):
         ole_wx_open_id=account_config["ole_wx_open_id"],
         shop_code=account_config["shop_code"],
         city_id=account_config["city_id"],
-        user_agent=account_config.get("user_agent")
+        user_agent=account_config.get("user_agent"),
+        app_version=account_config.get("appVersion", "1.11.4"),
     )
 
     print("=" * 50)
-    print(f"账号: {account_name} ({account_config['device_name']})")
+    print(f"账号: {account_name} ({account_config.get('device_name', '?')})")
     print("=" * 50)
 
     # 执行签到
@@ -64,15 +65,39 @@ def process_account(account_config):
     result = api.sign_in()
 
     # 处理签到结果
+    # 成功口径（抓包实测）：{"state_code":200,"data":{"integral":5,"sign_day":1}}
+    # 已签口径（2026-10-26 实测）：{"state_code":3001,"data":{},"message":"当日签到已完成，请勿重复签到！"}
+    # ⚠️ 两个坑：
+    #   1) 成功/业务失败用 state_code（下划线），鉴权失败用 stateCode（驼峰），别混。
+    #   2) 业务失败的原因在 **message**（不是 msg）；但鉴权失败用的是 msg。
+    #      2026-10-26 线上就因此把「今日已签」误判成失败，两处都要读。
     if "error" in result:
         error_msg = result['error']
         print(f"❌ 签到失败: {error_msg}")
         result_info['error'] = error_msg
     else:
-        print(f"✅ 签到成功!")
-        print(f"响应数据: {result}")
-        result_info['success'] = True
-        result_info['message'] = "签到成功"
+        state_code = str(result.get("state_code") or "")
+        text = str(result.get("message") or result.get("msg") or "")
+        data = result.get("data") or {}
+
+        if state_code == "200":
+            integral = data.get("integral")
+            sign_day = data.get("sign_day")
+            result_info['success'] = True
+            result_info['message'] = f"签到成功 +{integral} 积分" if integral is not None else "签到成功"
+            if sign_day:
+                result_info['message'] += f"（第 {sign_day} 天）"
+            print(f"✅ {result_info['message']}")
+            print(f"响应数据: {json.dumps(result, ensure_ascii=False)}")
+        elif state_code == "3001" or "已签" in text or "已完成" in text:
+            # 今日已签不是失败
+            result_info['success'] = True
+            result_info['message'] = "今日已签到"
+            print(f"✅ 今日已签到: {text}")
+        else:
+            error_msg = text or f"未知响应: {json.dumps(result, ensure_ascii=False)[:120]}"
+            print(f"❌ 签到失败: {error_msg}")
+            result_info['error'] = error_msg
 
     print("\n" + "=" * 50)
     return result_info
@@ -132,14 +157,15 @@ def send_notification_summary(all_results, start_time, end_time):
 
         content = "\n".join(content_parts)
 
-        # 发送通知
-        send_notification(
+        # 发送通知（静默模式下返回 False，由 run_all.py 统一汇总）
+        sent = send_notification(
             title=title,
             content=content,
             sound=sound,
             group="Ole精品超市"
         )
-        print("✅ 推送通知发送成功")
+        if sent:
+            print("✅ 推送通知发送成功")
 
     except Exception as e:
         print(f"❌ 推送通知失败: {str(e)}")
@@ -159,8 +185,8 @@ def main():
     accounts = config.get('huaruntong', {}).get('ole', {}).get('accounts', [])
 
     if not accounts:
-        print("❌ 配置文件中没有找到账号信息")
-        return
+        print("❌ 配置文件中没有找到账号信息 (huaruntong.ole.accounts)")
+        return 1
 
     # 收集所有账号的结果
     all_results = []
@@ -185,15 +211,20 @@ def main():
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
 
+    success_count = sum(1 for r in all_results if r.get('success'))
     print(f"\n{'='*60}")
     print(f"## Ole签到任务完成")
+    print(f"## 成功: {success_count}/{len(all_results)}  失败: {len(all_results) - success_count}")
     print(f"## 结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"## 执行耗时: {int(duration)} 秒")
     print(f"{'='*60}\n")
 
-    # 发送推送通知
+    # 发送推送通知（run_all.py 调度时会因 CHECKIN_NOTIFY_SILENT=1 自动跳过）
     send_notification_summary(all_results, start_time, end_time)
+
+    failed = [r for r in all_results if not r.get('success')]
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

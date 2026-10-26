@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+余额查询模块（供 run_all.py 汇总推送使用）
+
+各平台在「签到」之外还关心「还剩多少额度能用」。本模块把余额查询独立出来，
+与签到主流程解耦：**任何异常都只返回 None，绝不影响签到结果与推送**。
+
+已支持（2026-10-25 实测）：
+
+| 平台 | 接口 | 口径 |
+|---|---|---|
+| trae | `POST https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage` | 账号总积分账户 |
+| workbuddy | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-resource` | 资源包剩余合计 |
+
+凭证复用 `config/token.json`，与签到脚本同一份，不额外配置。
+
+设计要点
+--------
+1. **只读**：本模块不写任何配置文件。
+2. **独立超时**：单项余额查询超时远小于签到，避免拖慢整体调度。
+3. **失败降级**：拿不到就返回 None，汇总里不显示该项，不报错。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+TOKEN_PATH = PROJECT_ROOT / "config" / "token.json"
+
+# 余额查询统一超时（秒）。比签到短，避免网络抖动拖慢汇总
+DEFAULT_TIMEOUT = 15
+
+
+def _load_config() -> Dict[str, Any]:
+    """读取 config/token.json，失败返回空字典"""
+    try:
+        if not TOKEN_PATH.is_file():
+            return {}
+        return json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _load_platform_api(platform: str):
+    """
+    按平台加载各自的 api.py
+
+    ⚠️ 关键坑：`script/trae/api.py` 与 `script/workbuddy/api.py` **同名**，
+    都用 `sys.path.insert` + `import api` 的话，后加载的一方会命中
+    sys.modules 里已缓存的另一方（实测报 `cannot import name 'WorkBuddyAPI'
+    from 'api'`）。故用 importlib 以带平台前缀的唯一模块名加载，互不干扰。
+    """
+    import importlib.util
+
+    mod_name = f"_checkin_{platform}_api"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+
+    path = PROJECT_ROOT / "script" / platform / "api.py"
+    if not path.is_file():
+        raise ImportError(f"找不到 {path}")
+
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _num(value: Any) -> Optional[float]:
+    """宽松转浮点，失败返回 None（上游有的给字符串有的给数字）"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt(value: float) -> str:
+    """整数不带小数点，小数保留两位"""
+    return str(int(value)) if abs(value - round(value)) < 1e-9 else f"{value:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Trae CN
+# ---------------------------------------------------------------------------
+
+def fetch_trae_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    """
+    查询 Trae CN 账号积分余额
+
+    链路与签到脚本一致：sessionid -> X-Cloudide-Session -> Cloud-IDE-JWT -> 余额接口。
+    必须换 JWT：余额接口不接受 sessionid。
+
+    Returns:
+        Optional[Dict]: {'used','total','remaining','packs','expire_at'}；失败返回 None
+    """
+    config = _load_config()
+    accounts = (config.get("trae") or {}).get("accounts") or []
+    sessionid = next(
+        (str(a.get("sessionid") or "").strip() for a in accounts if a.get("sessionid")),
+        "",
+    )
+    if not sessionid:
+        return None
+
+    try:
+        # 复用签到脚本的登录链路，避免两份逻辑漂移
+        api_mod = _load_platform_api("trae")
+        TraeWebAPI = api_mod.TraeWebAPI
+        login_refresh = api_mod.login_refresh
+
+        refreshed = login_refresh(sessionid, timeout=timeout)
+        if not refreshed.get("success"):
+            logging.debug("trae 余额: 刷新 session 失败 %s", refreshed.get("error"))
+            return None
+
+        api = TraeWebAPI(session=refreshed["session"], timeout=timeout)
+        if not api.get_user_id():
+            logging.debug("trae 余额: 换 JWT 失败")
+            return None
+
+        import requests  # noqa: WPS433
+
+        resp = requests.post(
+            "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
+            headers={
+                "Authorization": f"Cloud-IDE-JWT {api._jwt}",
+                "Content-Type": "application/json",
+                "x-device-id": "1234567890123456",
+                "User-Agent": "VSCode 1.107.1 (TRAE SOLO CN)",
+            },
+            json={"require_usage": True, "req_source": 1},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            logging.debug("trae 余额: http=%s", resp.status_code)
+            return None
+        data = resp.json() or {}
+        if data.get("code") not in (None, 0):
+            logging.debug("trae 余额: 业务错误 %s", data.get("message"))
+            return None
+
+        summary = data.get("usage_summary") or {}
+        total = _num(summary.get("total_amount"))
+        used = _num(summary.get("consumed_amount"))
+        if total is None:
+            return None
+        remaining = round(total - (used or 0), 2)
+
+        # 取所有资源包中最晚的到期时间，作为"账户有效期"参考
+        expire_at = ""
+        for pack in data.get("user_entitlement_pack_list") or []:
+            end = pack.get("expire_time") or (pack.get("entitlement_base_info") or {}).get("end_time")
+            if isinstance(end, (int, float)) and end > 0:
+                stamp = time.strftime("%Y-%m-%d", time.localtime(end))
+                if stamp > expire_at:
+                    expire_at = stamp
+
+        return {
+            "used": used or 0,
+            "total": total,
+            "remaining": remaining,
+            "packs": len(data.get("user_entitlement_pack_list") or []),
+            "expire_at": expire_at,
+        }
+    except Exception as exc:  # noqa: BLE001 - 余额是附加信息，绝不抛出
+        logging.debug("trae 余额查询失败: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# WorkBuddy / CodeBuddy
+# ---------------------------------------------------------------------------
+
+def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    """
+    查询 WorkBuddy(CodeBuddy) 积分余额
+
+    上游按「资源包」发放积分（活动赠送、拉新权益等各成一个包，各有独立周期），
+    余额 = 所有包剩余额度之和。只统计 `Status == 0`（有效）的包，
+    避免把已失效/已过期的包算进去。
+
+    Returns:
+        Optional[Dict]: {'remaining','total','used','packs','soonest_expire'}；失败返回 None
+    """
+    config = _load_config()
+    accounts = (config.get("workbuddy") or {}).get("accounts") or []
+    account = next(
+        (a for a in accounts if a.get("access_token")),
+        None,
+    )
+    if not account:
+        return None
+
+    try:
+        WorkBuddyAPI = _load_platform_api("workbuddy").WorkBuddyAPI
+
+        api = WorkBuddyAPI(
+            access_token=account["access_token"],
+            refresh_token=account.get("refresh_token"),
+            uid=account.get("uid"),
+            domain=account.get("domain"),
+            timeout=timeout,
+        )
+        result = api._post("/v2/billing/meter/get-user-resource")
+        if not result.get("success"):
+            logging.debug("workbuddy 余额: %s", result.get("error"))
+            return None
+
+        data = ((result.get("data") or {}).get("Response") or {}).get("Data") or {}
+        packs = data.get("Accounts") or []
+        if not packs:
+            return None
+
+        remaining = used = total = 0.0
+        active = 0
+        soonest = ""
+        for pack in packs:
+            # Status 0 为有效；其它值（失效/冻结）不计入可用余额
+            if str(pack.get("Status")) != "0":
+                continue
+            active += 1
+            # 优先用 Precise 字段（保留小数），缺失时退回整数字段
+            remain = _num(pack.get("CapacityRemainPrecise"))
+            if remain is None:
+                remain = _num(pack.get("CapacityRemain"))
+            size = _num(pack.get("CapacitySizePrecise"))
+            if size is None:
+                size = _num(pack.get("CapacitySize"))
+            used_v = _num(pack.get("CapacityUsedPrecise"))
+            if used_v is None:
+                used_v = _num(pack.get("CapacityUsed"))
+
+            remaining += remain or 0
+            total += size or 0
+            used += used_v or 0
+
+            cycle_end = str(pack.get("CycleEndTime") or "")
+            if cycle_end:
+                # 只关心「还有余额且最早到期」的包，用来提示何时该续
+                if (remain or 0) > 0 and (not soonest or cycle_end < soonest):
+                    soonest = cycle_end
+
+        return {
+            "remaining": round(remaining, 2),
+            "total": round(total, 2),
+            "used": round(used, 2),
+            "packs": active,
+            "soonest_expire": soonest[:10] if soonest else "",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("workbuddy 余额查询失败: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 华润通（微信版）
+# ---------------------------------------------------------------------------
+
+def fetch_huaruntong_wx_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    """
+    查询华润通积分余额
+
+    走 `/api/points/querySummary`（加密通道，复用签到脚本的 api.py，
+    避免把 HMAC+AES+RSA 那套再抄一遍）。响应形如：
+        {"code":"S0A00000","data":{"data":{"cPoints":{"points":644,
+         "availablePoints":644,"holdPoints":0}}}}
+
+    Returns:
+        Optional[Dict]: {'remaining','total','hold'}；失败返回 None
+    """
+    config = _load_config()
+    accounts = (config.get("huaruntong") or {}).get("huaruntong_wx", {}).get("accounts") or []
+    account = next((a for a in accounts if a.get("token")), None)
+    if not account:
+        return None
+
+    try:
+        api_mod = _load_platform_api("huaruntong/huaruntong_wx")
+        api = api_mod.HuaRunTongAPI(
+            token=account["token"],
+            user_agent=account.get("user_agent"),
+            timeout=timeout,
+        )
+        resp = api.query_summary()
+        if not isinstance(resp, dict) or resp.get("code") != "S0A00000":
+            logging.debug("huaruntong_wx 余额: 响应异常 %s", resp)
+            return None
+
+        c_points = ((resp.get("data") or {}).get("data") or {}).get("cPoints") or {}
+        available = _num(c_points.get("availablePoints"))
+        total_ = _num(c_points.get("points"))
+        hold = _num(c_points.get("holdPoints"))
+        if available is None and total_ is None:
+            return None
+        return {
+            "remaining": available if available is not None else total_,
+            "total": total_ if total_ is not None else available,
+            "hold": hold or 0,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("huaruntong_wx 余额查询失败: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 汇总
+# ---------------------------------------------------------------------------
+
+BALANCE_FETCHERS = {
+    "trae": fetch_trae_balance,
+    "workbuddy": fetch_workbuddy_balance,
+    "huaruntong_wx": fetch_huaruntong_wx_balance,
+}
+
+
+def format_balance_line(key: str, balance: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    把余额字典格式化成一行推送文案
+
+    Returns:
+        Optional[str]: 格式化后的行；无数据时返回 None（汇总里就不显示）
+    """
+    if not balance:
+        return None
+    remaining = balance.get("remaining")
+    if remaining is None:
+        return None
+
+    if key == "trae":
+        text = f"💰 余额 {_fmt(remaining)} / {_fmt(balance.get('total') or 0)} 积分"
+        if balance.get("expire_at"):
+            text += f"（有效至 {balance['expire_at']}）"
+        return text
+
+    if key == "workbuddy":
+        text = f"💰 余额 {_fmt(remaining)} 积分（{balance.get('packs', 0)} 个有效包）"
+        if balance.get("soonest_expire"):
+            text += f"，最近到期 {balance['soonest_expire']}"
+        return text
+
+    if key == "huaruntong_wx":
+        text = f"💰 可用 {_fmt(remaining)} 积分"
+        if balance.get("total") is not None and _fmt(balance["total"]) != _fmt(remaining):
+            text += f" / 总 {_fmt(balance['total'])}"
+        if balance.get("hold"):
+            text += f"（冻结 {_fmt(balance['hold'])}）"
+        return text
+
+    return f"💰 余额 {_fmt(remaining)}"
+
+
+def collect_balances(platform_keys: list) -> Dict[str, Optional[Dict[str, Any]]]:
+    """并发查询多个平台余额；单个失败不影响其它"""
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for key in platform_keys:
+        fetcher = BALANCE_FETCHERS.get(key)
+        out[key] = fetcher() if fetcher else None
+    return out
+
+
+if __name__ == "__main__":
+    # 手动调试：python3 balance.py
+    logging.basicConfig(level=logging.DEBUG, format="%(message)s")
+    for k in BALANCE_FETCHERS:
+        raw = BALANCE_FETCHERS[k]()
+        print(f"{k}: {json.dumps(raw, ensure_ascii=False)}")
+        print(f"    -> {format_balance_line(k, raw)}")

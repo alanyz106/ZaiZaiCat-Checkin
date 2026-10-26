@@ -67,14 +67,29 @@ def process_account(account_config):
     result = api.sign_in()
 
     # 解析结果
-    if result.get('code') == "S0A00000":
+    # 成功口径（2026-10-26 实测）：
+    #   S0A00000            → 本次签到成功，data.integral 为本次获得的积分
+    #   E1B00101 "不能重复签到" → 今日已签，属于「正常」而非失败，退出码按成功算
+    code = result.get('code')
+    msg = result.get('msg') or result.get('message') or ''
+    if code == "S0A00000":
         result_info['success'] = True
-        result_info['message'] = result.get('message', '签到成功')
+        result_info['message'] = msg or '签到成功'
         result_info['response'] = result
-        print("✅ 签到成功")
+        print(f"✅ 签到成功: {result_info['message']}")
+    elif code == "E1B00101" or "不能重复签到" in msg or "已签到" in msg:
+        result_info['success'] = True
+        result_info['message'] = "今日已签到"
+        result_info['response'] = result
+        print(f"✅ 今日已签到: {msg}")
+    elif result.get('error'):
+        # 网络层错误（超时、DNS、连接重置等）
+        result_info['error'] = result['error']
+        result_info['response'] = result['error']
+        print(f"❌ 请求失败: {result_info['error']}")
     else:
-        result_info['error'] = result.get('msg', '签到失败')
-        result_info['response'] = result.get('msg')
+        result_info['error'] = msg or f"签到失败(未知响应码 {code})"
+        result_info['response'] = msg
         print(f"❌ 签到失败: {result_info['error']}")
 
     print("响应:")
@@ -139,20 +154,21 @@ def send_notification_summary(all_results, start_time, end_time):
 
         content = "\n".join(content_parts)
 
-        # 发送通知
-        send_notification(
+        # 发送通知（静默模式下返回 False，由 run_all.py 统一汇总）
+        sent = send_notification(
             title=title,
             content=content,
             sound=sound
         )
-        print("✅ 推送通知发送成功")
+        if sent:
+            print("✅ 推送通知发送成功")
 
     except Exception as e:
         print(f"❌ 推送通知失败: {str(e)}")
 
 
 def main():
-    """主函数"""
+    """主函数，返回退出码：0 = 全部成功/今日已签，1 = 存在失败账号或配置缺失"""
     # 记录开始时间
     start_time = datetime.now()
     print(f"\n{'='*60}")
@@ -165,8 +181,8 @@ def main():
     accounts = config.get('huaruntong', {}).get('huaruntong_wx', {}).get('accounts', [])
 
     if not accounts:
-        print("❌ 配置文件中没有找到账号信息")
-        return
+        print("❌ 配置文件中没有找到账号信息 (huaruntong.huaruntong_wx.accounts)")
+        return 1
 
     # 收集所有账号的结果
     all_results = []
@@ -191,15 +207,20 @@ def main():
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
 
+    success_count = sum(1 for r in all_results if r.get('success'))
     print(f"\n{'='*60}")
     print(f"## 华润通签到任务完成")
+    print(f"## 成功: {success_count}/{len(all_results)}  失败: {len(all_results) - success_count}")
     print(f"## 结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"## 执行耗时: {int(duration)} 秒")
     print(f"{'='*60}\n")
 
-    # 发送推送通知
+    # 发送推送通知（run_all.py 调度时会因 CHECKIN_NOTIFY_SILENT=1 自动跳过）
     send_notification_summary(all_results, start_time, end_time)
+
+    failed = [r for r in all_results if not r.get('success')]
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

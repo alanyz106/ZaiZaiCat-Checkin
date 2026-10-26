@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -79,14 +79,40 @@ PLATFORMS: List[Platform] = [
         config_node="workbuddy",
         env={"WORKBUDDY_JITTER_MAX": "0"},
     ),
+    # NOTE(2026-10-25): agentrouter 已停用——github_session 生命周期过短
+    # （观察到数小时内即失效），每日 cron 必然失败。恢复方法：补回下面这段并更新
+    # config/token.json 的 github_session。（原因：token 寿命太短，不适合每日 cron）
+    # Platform(
+    #     key="agentrouter",
+    #     name="Agent Router",
+    #     script="script/agentrouter/main.py",
+    #     config_node="agentrouter",
+    #     supports_dry_run=True,
+    #     # 走代理访问，站点对 oauth/state 有按 IP 限流，留足等待重试的时间
+    #     timeout=1200,
+    # ),
+    # ------------------------------------------------------------------
+    # 华润系（2026-10-26 抓包接线）
+    #
+    # 四个子服务在 config/token.json 里共用顶层节点 `huaruntong`，
+    # 各自一层子节点，故 config_node 用点号路径表达（见 has_accounts）。
+    #
+    # 只注册两个：另外两个经用户实测确认「小程序内无签到/答题功能」，
+    # 不是抓包失败，脚本保留不跑：
+    #   wentiweilaihui — 无签到、无好物兑换
+    #   999            — 签到与答题入口均无，疑活动下线
+    # ------------------------------------------------------------------
     Platform(
-        key="agentrouter",
-        name="Agent Router",
-        script="script/agentrouter/main.py",
-        config_node="agentrouter",
-        supports_dry_run=True,
-        # 走代理访问，站点对 oauth/state 有按 IP 限流，留足等待重试的时间
-        timeout=1200,
+        key="huaruntong_wx",
+        name="华润通",
+        script="script/huaruntong/huaruntong_wx/main.py",
+        config_node="huaruntong.huaruntong_wx",
+    ),
+    Platform(
+        key="ole",
+        name="Ole精品超市",
+        script="script/huaruntong/ole/main.py",
+        config_node="huaruntong.ole",
     ),
 ]
 
@@ -108,10 +134,22 @@ def load_config() -> Dict:
 
 
 def has_accounts(config: Dict, node: Optional[str]) -> bool:
-    """判断配置中该节点是否至少有一个账号"""
+    """
+    判断配置中该节点是否至少有一个账号
+
+    node 支持用点号表示嵌套路径，例如：
+      "workbuddy"               → config["workbuddy"]["accounts"]
+      "huaruntong.huaruntong_wx" → config["huaruntong"]["huaruntong_wx"]["accounts"]
+    华润系的四个子服务共用 huaruntong 顶层节点、各自一层子节点，
+    用嵌套路径就不必为它们把 token.json 拍平。
+    """
     if not node:
         return True
-    node_conf = config.get(node)
+    node_conf: Any = config
+    for part in node.split("."):
+        if not isinstance(node_conf, dict):
+            return False
+        node_conf = node_conf.get(part)
     if not isinstance(node_conf, dict):
         return False
     accounts = node_conf.get("accounts")
@@ -273,9 +311,53 @@ def extract_highlights(output: str, limit: int = 4) -> List[str]:
     return picked
 
 
+def collect_balance_lines(results: List[Dict], tee: Tee) -> List[str]:
+    """
+    收集各平台余额，格式化成推送文本行
+
+    余额属于附加信息，任何异常都只记日志、不抛出——绝不能因为查余额失败
+    而影响签到汇总推送本身。
+
+    Args:
+        results (List[Dict]): run_platform 的结果列表（用其中实际跑过的平台）
+        tee (Tee): 日志输出
+
+    Returns:
+        List[str]: 形如 "Trae CN: 💰 余额 584.86 / 600 积分" 的行
+    """
+    # 只查本次实际运行的平台；跳过 missing（脚本不存在）的
+    keys = [r["key"] for r in results if r.get("status") != "missing"]
+    names = {r["key"]: r["name"] for r in results}
+    if not keys:
+        return []
+
+    try:
+        from balance import BALANCE_FETCHERS, format_balance_line
+    except Exception as exc:  # noqa: BLE001
+        tee.write(f"\n⚠️ 余额模块不可用，跳过余额查询: {exc}\n")
+        return []
+
+    lines: List[str] = []
+    for key in keys:
+        if key not in BALANCE_FETCHERS:
+            continue
+        try:
+            data = BALANCE_FETCHERS[key]()
+            line = format_balance_line(key, data)
+        except Exception as exc:  # noqa: BLE001
+            tee.write(f"\n⚠️ {names.get(key, key)} 余额查询异常: {exc}\n")
+            continue
+        if line:
+            lines.append(f"{names.get(key, key)}: {line}")
+            tee.write(f"\n{names.get(key, key)} 余额: {line}\n")
+        else:
+            tee.write(f"\nℹ️ {names.get(key, key)} 余额查询无结果（已跳过，不影响签到）\n")
+    return lines
+
+
 def send_summary_notification(results: List[Dict], elapsed: float,
                               started: datetime, dry_run: bool,
-                              tee: Tee) -> None:
+                              tee: Tee, include_balance: bool = True) -> None:
     """
     发送统一汇总通知
 
@@ -307,6 +389,13 @@ def send_summary_notification(results: List[Dict], elapsed: float,
         lines.append(f"{icon} {r['name']}{duration}{detail}")
         for hl in r.get("highlights") or []:
             lines.append(f"    {hl}")
+
+    # 余额区块：签到之外最关心的信息，单独成段便于扫读。
+    # 全部查询失败时整段省略，不显示空标题。
+    balance_lines = collect_balance_lines(results, tee) if include_balance else []
+    if balance_lines:
+        lines.extend(["", "———— 余额 ————"])
+        lines.extend(balance_lines)
 
     if failed_names:
         lines.extend(["", f"❗ 需处理: {', '.join(failed_names)}"])
@@ -347,6 +436,7 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="列出平台注册表后退出")
     parser.add_argument("--no-lock", action="store_true", help="跳过文件锁（调试用）")
     parser.add_argument("--no-notify", action="store_true", help="不发送汇总通知")
+    parser.add_argument("--no-balance", action="store_true", help="汇总里不附带余额查询")
     args = parser.parse_args()
 
     # nargs="*" 时 "$@" 为空可能传入空字符串（如 shell 包装脚本），这里过滤并校验
@@ -419,7 +509,8 @@ def main() -> int:
 
     # 统一通知：一条消息汇总全部平台
     if not args.no_notify:
-        send_summary_notification(results, elapsed, started, args.dry_run, tee)
+        send_summary_notification(results, elapsed, started, args.dry_run, tee,
+                                  include_balance=not args.no_balance)
 
     tee.close()
     if lock_file:
