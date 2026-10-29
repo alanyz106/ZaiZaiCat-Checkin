@@ -26,7 +26,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # 获取项目根目录
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -113,6 +113,14 @@ class WorkBuddyTasks:
         """
         令牌刷新后回写配置文件，避免下次执行仍使用过期令牌
 
+        刷新成功会把旧的 refresh_token 就地轮换作废，若新令牌只留在内存中，
+        进程退出后账号就永久失效（必须回客户端重新导入）。
+        因此本方法必须在**每一条返回路径**上都被调用到（调用点不止一处，
+        见 _persist_if_refreshed）。
+
+        写入成功后把 api.token_refreshed 复位为 False，保证同一个账号
+        在一次运行中最多写一次，重复调用不会反复落盘。
+
         Args:
             account_index (int): 账号在配置数组中的下标
             api (WorkBuddyAPI): 持有最新令牌的API实例
@@ -138,9 +146,22 @@ class WorkBuddyTasks:
                 json.dump(config_data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, self.config_path)
 
+            # 已持久化，复位标记，避免后续调用点重复写入
+            api.token_refreshed = False
             self.logger.info("💾 新令牌已写回配置文件")
         except Exception as e:
             self.logger.warning(f"⚠️ 回写令牌失败: {e}")
+
+    def _persist_if_refreshed(self, account_index: int, api: Optional[WorkBuddyAPI]) -> None:
+        """
+        安全网：只要本次运行中刷新过令牌就立即落盘。
+
+        早期版本只在 process_account 末尾回写，而「今日已签到」「活动未开启」
+        以及各类失败分支都会提前 return，导致刷新后的令牌丢失。
+        现在改为在每个可能提前返回的位置之前调用。
+        """
+        if api is not None and getattr(api, 'token_refreshed', False):
+            self._save_refreshed_token(account_index, api)
 
     def process_account(self, account_index: int, account_info: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -169,6 +190,7 @@ class WorkBuddyTasks:
         }
 
         try:
+            api: Optional[WorkBuddyAPI] = None
             access_token = account_info.get('access_token')
             if not access_token:
                 error_msg = "账号配置中缺少 access_token"
@@ -197,6 +219,9 @@ class WorkBuddyTasks:
                 else:
                     result['message'] = error_msg
                     self.logger.error(f"❌ {account_name} {error_msg}")
+                # 刷新成功但重放仍失败时，新令牌同样必须落盘，
+                # 否则既丢了令牌又要重新导入，等于白刷
+                self._persist_if_refreshed(account_index, api)
                 return result
 
             result['status_info'] = status
@@ -210,6 +235,7 @@ class WorkBuddyTasks:
                 result['success'] = True
                 result['message'] = '签到活动未开启或不适用'
                 self.logger.info(f"ℹ️ {account_name} 签到活动未开启")
+                self._persist_if_refreshed(account_index, api)
                 return result
 
             # 今日已签到
@@ -220,6 +246,7 @@ class WorkBuddyTasks:
                 result['credit'] = status.get('today_credit')
                 result['streak_days'] = status.get('streak_days')
                 self.logger.info(f"✅ {account_name} 今日已签到")
+                self._persist_if_refreshed(account_index, api)
                 return result
 
             # 执行签到
@@ -253,8 +280,7 @@ class WorkBuddyTasks:
                     self.logger.error(f"❌ {account_name} 签到失败: {result['message']}")
 
             # 令牌被刷新过则回写配置
-            if api.token_refreshed:
-                self._save_refreshed_token(account_index, api)
+            self._persist_if_refreshed(account_index, api)
 
         except Exception as e:
             error_msg = f"处理账号时发生异常: {str(e)}"
@@ -262,6 +288,8 @@ class WorkBuddyTasks:
             result['message'] = error_msg
             import traceback
             traceback.print_exc()
+            # 异常路径同样兜底落盘：异常可能就发生在刷新之后
+            self._persist_if_refreshed(account_index, api)
 
         return result
 

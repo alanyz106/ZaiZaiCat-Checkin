@@ -134,14 +134,37 @@ python import_accounts.py --path "%LOCALAPPDATA%/CodeBuddyExtension/Data/Public/
 
 | 令牌 | 有效期 | 轮换方式 |
 |------|--------|---------|
-| `access_token` | 60 天 | 过期后用 `refresh_token` 换新 |
-| `refresh_token` | 90 天 | 刷新时随 `access_token` 一起换新，从刷新时刻重新计 90 天 |
+| `access_token` | 约 28 天 | 过期后用 `refresh_token` 换新 |
+| `refresh_token` | 约 30 天 | 刷新时随 `access_token` 一起换新，从刷新时刻重新计 30 天 |
 
-脚本在签到遇到令牌过期时会自动刷新并回写配置。**只要脚本每 90 天内至少成功运行一次，令牌即可无限续期**；连续 90 天未运行才需要重新导入账号。
+> 📌 **实测数据（2026-10-25 签发的令牌）**：`iat` = 10-25 10:10，
+> `access_token` `exp` = 11-22 10:10（28 天），`refresh_token` `exp` = 11-24 10:10（30 天）。
+> 早期文档写的「60 天 / 90 天」与实测不符，此处已按实际值修正。
+> 若后续观察到服务端调整有效期，以真实 JWT 的 `exp - iat` 为准。
+
+脚本在签到遇到令牌过期时会自动刷新并回写配置。**只要脚本每 30 天内至少成功运行一次，令牌即可无限续期**；连续 30 天未运行才需要重新导入账号。
+
+⭐ **回写时机**：刷新后立即落盘，覆盖所有返回路径——「今日已签到」「活动未开启」「签到失败」「异常」等提前返回的分支都会先写配置再退出。因为刷新会让旧 `refresh_token` 立即作废，只要刷成功就必须持久化，否则下次运行直接 401。
+
+### 跨平台使用（Windows 导入 → Linux 运行）
+
+令牌**不绑定设备、不绑定 IP、不绑定操作系统**，签发方是 Keycloak（`realm = copilot`），服务端只校验 JWT 签名、`exp` 与 `sid` 会话。
+
+因此可以：
+
+- 在 Windows 客户端上用 `import_accounts.py` 解出令牌，写进 `config/token.json`
+- 把配置拷贝到 Linux 服务器，每天 cron 跑签到
+
+签到只用纯 HTTP（`requests`），无需安装官方客户端、Node，也无需浏览器。唯一要求是**服务器能直连 `www.codebuddy.cn` 且系统时间准确**（`exp` 按秒校验，时钟偏移过大会被判过期）。
+
+请求中不存在任何指纹类字段，`User-Agent` 是硬编码的 macOS Chrome 字符串，与本机实际系统无关。
+
+> ⚠️ 注意：**只有「取令牌」这一步是平台相关的**（要靠客户端凭据库 / DPAPI / `$wbEncrypted` 信封解密），而客户端只有 Windows/macOS 版。Linux 上负责跑签到，令牌彻底失效时仍需回 Windows 重新导入一份配置。
 
 ### 与 cockpit-tools 并行使用
 
-[cockpit-tools](https://github.com/jlcodes99/cockpit-tools) 的自动签到会在执行时刷新令牌（refresh token 轮换），这会使 `config/token.json` 里的旧令牌立即失效。脚本**不会自动从本机拉取令牌**，若两边同时使用，cockpit 侧刷新令牌后需重新运行 `import_accounts.py` 更新，或建议二选一，避免重复签到。
+[cockpit-tools](https://github.com/jlcodes99/cockpit-tools) 的自动签到会在执行时刷新令牌（refresh token 轮换），这会使 `config/token.json` 里的旧令牌立即失效。脚本**不会自动从本机拉取令牌**，若两边同时使用，cockpit 侧刷新令牌后需重新运行 `import_accounts.py` 更新，或建议二选一，避免重复签到。同理，Windows 客户端与 Linux 服务器**不要同时持有同一账号的令牌**——谁先刷新，另一侧立即失效。
+
 
 ## 🚀 使用方法
 
