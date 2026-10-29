@@ -187,9 +187,23 @@ def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str
     """
     查询 WorkBuddy(CodeBuddy) 积分余额
 
-    上游按「资源包」发放积分（活动赠送、拉新权益等各成一个包，各有独立周期），
-    余额 = 所有包剩余额度之和。只统计 `Status == 0`（有效）的包，
-    避免把已失效/已过期的包算进去。
+    上游按「资源包」发放积分（活动赠送、拉新权益等各成一个包，各有独立周期）。
+    只统计 `Status == 0`（有效）的包。
+
+    口径说明（2026-10-29 修正）
+    --------------------------
+    早期版本用 `CapacityRemainPrecise`（包总剩余）求和，会虚高。
+    该字段与 `CycleCapacityRemainPrecise`（当期剩余）在「体验版」等特殊包上
+    会互相矛盾：实测 `CapacityRemain=500` 而 `CycleCapacityRemain=0`、
+    `CycleCapacityUsed=500`（即额度已用尽，但包级字段没同步），
+    导致余额虚高 500 分，且「最近到期」提示指向一个实际剩 0 的包。
+
+    腾讯计费资源包的正确语义是：
+
+        可用额度 = 当期剩余 + 剩余整周期数 × 每周期额度
+                 = CycleCapacityRemain + RemainCycles * CycleCapacitySize
+
+    当前所有包均为单周期（RemainCycles=0），故等价于 CycleCapacityRemain 求和。
 
     Returns:
         Optional[Dict]: {'remaining','total','used','packs','soonest_expire'}；失败返回 None
@@ -225,31 +239,57 @@ def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str
 
         remaining = used = total = 0.0
         active = 0
+        usable = 0          # 真实还有额度可用的包数（区别于 active）
         soonest = ""
         for pack in packs:
             # Status 0 为有效；其它值（失效/冻结）不计入可用余额
             if str(pack.get("Status")) != "0":
                 continue
             active += 1
-            # 优先用 Precise 字段（保留小数），缺失时退回整数字段
-            remain = _num(pack.get("CapacityRemainPrecise"))
-            if remain is None:
-                remain = _num(pack.get("CapacityRemain"))
-            size = _num(pack.get("CapacitySizePrecise"))
-            if size is None:
-                size = _num(pack.get("CapacitySize"))
-            used_v = _num(pack.get("CapacityUsedPrecise"))
-            if used_v is None:
-                used_v = _num(pack.get("CapacityUsed"))
 
-            remaining += remain or 0
+            # --- 当期剩余 ---
+            cycle_remain = _num(pack.get("CycleCapacityRemainPrecise"))
+            if cycle_remain is None:
+                cycle_remain = _num(pack.get("CycleCapacityRemain"))
+
+            # --- 未来整周期额度（多次续期包才有意义）---
+            cycles_left = _num(pack.get("RemainCycles")) or 0
+            cycle_size = _num(pack.get("CycleCapacitySizePrecise"))
+            if cycle_size is None:
+                cycle_size = _num(pack.get("CycleCapacitySize"))
+
+            if cycle_remain is None:
+                # 上游极少数包可能不返回 CycleCapacity*，
+                # 此时才退回包级字段，至少不把整个余额算成 0
+                remain = _num(pack.get("CapacityRemainPrecise"))
+                if remain is None:
+                    remain = _num(pack.get("CapacityRemain"))
+                remain = remain or 0
+            else:
+                remain = cycle_remain + cycles_left * (cycle_size or 0)
+
+            # --- 总量 / 已用：用于展示「还剩多少 / 一共多少」---
+            if cycle_remain is not None and cycle_size is not None:
+                cycles_total = _num(pack.get("TotalCycles")) or 1
+                size = cycle_size * cycles_total
+                used_v = size - remain
+            else:
+                size = _num(pack.get("CapacitySizePrecise"))
+                if size is None:
+                    size = _num(pack.get("CapacitySize"))
+                used_v = _num(pack.get("CapacityUsedPrecise"))
+                if used_v is None:
+                    used_v = _num(pack.get("CapacityUsed"))
+
+            remaining += remain
             total += size or 0
-            used += used_v or 0
+            used += max(used_v or 0, 0)
 
-            cycle_end = str(pack.get("CycleEndTime") or "")
-            if cycle_end:
-                # 只关心「还有余额且最早到期」的包，用来提示何时该续
-                if (remain or 0) > 0 and (not soonest or cycle_end < soonest):
+            if remain > 0:
+                usable += 1
+                cycle_end = str(pack.get("CycleEndTime") or "")
+                # 只关心「真的还有余额且最早到期」的包，用来提示何时该续
+                if cycle_end and (not soonest or cycle_end < soonest):
                     soonest = cycle_end
 
         return {
@@ -257,6 +297,7 @@ def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str
             "total": round(total, 2),
             "used": round(used, 2),
             "packs": active,
+            "usable_packs": usable,
             "soonest_expire": soonest[:10] if soonest else "",
         }
     except Exception as exc:  # noqa: BLE001
@@ -345,7 +386,14 @@ def format_balance_line(key: str, balance: Optional[Dict[str, Any]]) -> Optional
         return text
 
     if key == "workbuddy":
-        text = f"💰 余额 {_fmt(remaining)} 积分（{balance.get('packs', 0)} 个有效包）"
+        usable = balance.get("usable_packs")
+        active = balance.get("packs", 0)
+        if usable is not None and usable != active:
+            # 有「有效但额度已用尽」的包时，把两个数字都亮出来，避免误读
+            packs_text = f"{usable}/{active} 个包有余额"
+        else:
+            packs_text = f"{active} 个有效包"
+        text = f"💰 余额 {_fmt(remaining)} 积分（{packs_text}）"
         if balance.get("soonest_expire"):
             text += f"，最近到期 {balance['soonest_expire']}"
         return text
