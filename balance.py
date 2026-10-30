@@ -11,9 +11,21 @@
 | 平台 | 接口 | 口径 |
 |---|---|---|
 | trae | `POST https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage` | 账号总积分账户 |
-| workbuddy | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-resource` | 资源包剩余合计 |
+| workbuddy | `POST https://www.codebuddy.cn/v2/billing/meter/get-user-resource` | 资源包剩余合计（**多账号逐个统计**，2026-10-29） |
+| huaruntong_wx | `/api/points/querySummary` | 华润通可用积分 |
+| modelscope | `GET https://modelscope.cn/openapi/v1/magicubes/balance` | 魔搭魔粒可用余额（2026-10-30） |
 
 凭证复用 `config/token.json`，与签到脚本同一份，不额外配置。
+
+多账号口径（2026-10-29）
+-----------------------
+`fetch_workbuddy_balance` 遍历 `workbuddy.accounts` 的**全部**账号，返回体除汇总
+字段外还带 `accounts` 列表。`format_balance_line` 在账号数 > 1 时改为分条展示：
+
+    💰 alan 3943.89（至 2026-11-19） | FantaSea 596.41（至 2026-10-31） ｜ 合计 4540.30
+
+单账号（或旧调用方没传 `accounts`）时退化为原来的单行格式，行为不变。
+单个账号查询失败只跳过它自己，不影响其它账号与汇总推送。
 
 设计要点
 --------
@@ -33,8 +45,6 @@ from typing import Any, Dict, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 TOKEN_PATH = PROJECT_ROOT / "config" / "token.json"
-
-# 余额查询统一超时（秒）。比签到短，避免网络抖动拖慢汇总
 DEFAULT_TIMEOUT = 15
 
 
@@ -92,7 +102,7 @@ def _fmt(value: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Trae CN
+# 各平台余额查询
 # ---------------------------------------------------------------------------
 
 def fetch_trae_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
@@ -108,29 +118,30 @@ def fetch_trae_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any
     config = _load_config()
     accounts = (config.get("trae") or {}).get("accounts") or []
     sessionid = next(
-        (str(a.get("sessionid") or "").strip() for a in accounts if a.get("sessionid")),
+        (str(a.get("sessionid") or "").strip()
+         for a in accounts if a.get("sessionid")),
         "",
     )
     if not sessionid:
         return None
 
     try:
-        # 复用签到脚本的登录链路，避免两份逻辑漂移
         api_mod = _load_platform_api("trae")
         TraeWebAPI = api_mod.TraeWebAPI
         login_refresh = api_mod.login_refresh
 
         refreshed = login_refresh(sessionid, timeout=timeout)
         if not refreshed.get("success"):
-            logging.debug("trae 余额: 刷新 session 失败 %s", refreshed.get("error"))
+            logging.debug("trae 余额: 刷新 session 失败 %s",
+                          refreshed.get("error"))
             return None
 
-        api = TraeWebAPI(session=refreshed["session"], timeout=timeout)
+        api = TraeWebAPI(refreshed["session"], timeout=timeout)
         if not api.get_user_id():
             logging.debug("trae 余额: 换 JWT 失败")
             return None
 
-        import requests  # noqa: WPS433
+        import requests
 
         resp = requests.post(
             "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
@@ -158,10 +169,11 @@ def fetch_trae_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any
             return None
         remaining = round(total - (used or 0), 2)
 
-        # 取所有资源包中最晚的到期时间，作为"账户有效期"参考
+        # 多个资源包各有到期时间，取最晚的一个作为整体有效期
         expire_at = ""
         for pack in data.get("user_entitlement_pack_list") or []:
-            end = pack.get("expire_time") or (pack.get("entitlement_base_info") or {}).get("end_time")
+            end = (pack.get("expire_time")
+                   or (pack.get("entitlement_base_info") or {}).get("end_time"))
             if isinstance(end, (int, float)) and end > 0:
                 stamp = time.strftime("%Y-%m-%d", time.localtime(end))
                 if stamp > expire_at:
@@ -174,20 +186,16 @@ def fetch_trae_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any
             "packs": len(data.get("user_entitlement_pack_list") or []),
             "expire_at": expire_at,
         }
-    except Exception as exc:  # noqa: BLE001 - 余额是附加信息，绝不抛出
+    except Exception as exc:  # noqa: BLE001
         logging.debug("trae 余额查询失败: %s", exc)
         return None
 
 
-# ---------------------------------------------------------------------------
-# WorkBuddy / CodeBuddy
-# ---------------------------------------------------------------------------
-
-def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+def _workbuddy_packs_balance(packs: list) -> Optional[Dict[str, Any]]:
     """
-    查询 WorkBuddy(CodeBuddy) 积分余额
+    把单个 WorkBuddy 账号的资源包列表折算成余额字典（纯计算，便于多账号复用）
 
-    上游按「资源包」发放积分（活动赠送、拉新权益等各成一个包，各有独立周期）。
+    上游按「资源包」发放积分（活动赠送、拉新权益等各成一个包，各有独立周期），
     只统计 `Status == 0`（有效）的包。
 
     口径说明（2026-10-29 修正）
@@ -206,20 +214,77 @@ def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str
     当前所有包均为单周期（RemainCycles=0），故等价于 CycleCapacityRemain 求和。
 
     Returns:
-        Optional[Dict]: {'remaining','total','used','packs','soonest_expire'}；失败返回 None
+        Optional[Dict]: {'remaining','total','used','packs','usable_packs','soonest_expire'}
     """
-    config = _load_config()
-    accounts = (config.get("workbuddy") or {}).get("accounts") or []
-    account = next(
-        (a for a in accounts if a.get("access_token")),
-        None,
-    )
-    if not account:
-        return None
+    remaining = used = total = 0.0
+    active = 0
+    usable = 0          # 真实还有额度可用的包数（区别于 active）
+    soonest = ""
+    for pack in packs:
+        # Status 0 为有效；其它值（失效/冻结）不计入可用余额
+        if str(pack.get("Status")) != "0":
+            continue
+        active += 1
 
+        # --- 当期剩余 ---
+        cycle_remain = _num(pack.get("CycleCapacityRemainPrecise"))
+        if cycle_remain is None:
+            cycle_remain = _num(pack.get("CycleCapacityRemain"))
+
+        # --- 未来整周期额度（多次续期包才有意义）---
+        cycles_left = _num(pack.get("RemainCycles")) or 0
+        cycle_size = _num(pack.get("CycleCapacitySizePrecise"))
+        if cycle_size is None:
+            cycle_size = _num(pack.get("CycleCapacitySize"))
+
+        if cycle_remain is None:
+            # 上游极少数包可能不返回 CycleCapacity*，
+            # 此时才退回包级字段，至少不把整个余额算成 0
+            remain = _num(pack.get("CapacityRemainPrecise"))
+            if remain is None:
+                remain = _num(pack.get("CapacityRemain"))
+            remain = remain or 0
+        else:
+            remain = cycle_remain + cycles_left * (cycle_size or 0)
+
+        # --- 总量 / 已用：用于展示「还剩多少 / 一共多少」---
+        if cycle_remain is not None and cycle_size is not None:
+            cycles_total = _num(pack.get("TotalCycles")) or 1
+            size = cycle_size * cycles_total
+            used_v = size - remain
+        else:
+            size = _num(pack.get("CapacitySizePrecise"))
+            if size is None:
+                size = _num(pack.get("CapacitySize"))
+            used_v = _num(pack.get("CapacityUsedPrecise"))
+            if used_v is None:
+                used_v = _num(pack.get("CapacityUsed"))
+
+        remaining += remain
+        total += size or 0
+        used += max(used_v or 0, 0)
+
+        if remain > 0:
+            usable += 1
+            cycle_end = str(pack.get("CycleEndTime") or "")
+            # 只关心「真的还有余额且最早到期」的包，用来提示何时该续
+            if cycle_end and (not soonest or cycle_end < soonest):
+                soonest = cycle_end
+
+    return {
+        "remaining": round(remaining, 2),
+        "total": round(total, 2),
+        "used": round(used, 2),
+        "packs": active,
+        "usable_packs": usable,
+        "soonest_expire": soonest[:10] if soonest else "",
+    }
+
+
+def _fetch_one_workbuddy(account: Dict[str, Any], WorkBuddyAPI,
+                         timeout: int) -> Optional[Dict[str, Any]]:
+    """查询单个 WorkBuddy 账号的余额；失败返回 None（不影响其它账号）"""
     try:
-        WorkBuddyAPI = _load_platform_api("workbuddy").WorkBuddyAPI
-
         api = WorkBuddyAPI(
             access_token=account["access_token"],
             refresh_token=account.get("refresh_token"),
@@ -227,87 +292,78 @@ def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str
             domain=account.get("domain"),
             timeout=timeout,
         )
-        result = api._post("/v2/billing/meter/get-user-resource")
-        if not result.get("success"):
-            logging.debug("workbuddy 余额: %s", result.get("error"))
+        resp = api._post("/v2/billing/meter/get-user-resource")
+        if not isinstance(resp, dict):
+            logging.debug("workbuddy 余额: %s", resp)
             return None
-
-        data = ((result.get("data") or {}).get("Response") or {}).get("Data") or {}
-        packs = data.get("Accounts") or []
-        if not packs:
+        if not resp.get("success"):
+            logging.debug("workbuddy 余额: %s", resp.get("error"))
             return None
-
-        remaining = used = total = 0.0
-        active = 0
-        usable = 0          # 真实还有额度可用的包数（区别于 active）
-        soonest = ""
-        for pack in packs:
-            # Status 0 为有效；其它值（失效/冻结）不计入可用余额
-            if str(pack.get("Status")) != "0":
-                continue
-            active += 1
-
-            # --- 当期剩余 ---
-            cycle_remain = _num(pack.get("CycleCapacityRemainPrecise"))
-            if cycle_remain is None:
-                cycle_remain = _num(pack.get("CycleCapacityRemain"))
-
-            # --- 未来整周期额度（多次续期包才有意义）---
-            cycles_left = _num(pack.get("RemainCycles")) or 0
-            cycle_size = _num(pack.get("CycleCapacitySizePrecise"))
-            if cycle_size is None:
-                cycle_size = _num(pack.get("CycleCapacitySize"))
-
-            if cycle_remain is None:
-                # 上游极少数包可能不返回 CycleCapacity*，
-                # 此时才退回包级字段，至少不把整个余额算成 0
-                remain = _num(pack.get("CapacityRemainPrecise"))
-                if remain is None:
-                    remain = _num(pack.get("CapacityRemain"))
-                remain = remain or 0
-            else:
-                remain = cycle_remain + cycles_left * (cycle_size or 0)
-
-            # --- 总量 / 已用：用于展示「还剩多少 / 一共多少」---
-            if cycle_remain is not None and cycle_size is not None:
-                cycles_total = _num(pack.get("TotalCycles")) or 1
-                size = cycle_size * cycles_total
-                used_v = size - remain
-            else:
-                size = _num(pack.get("CapacitySizePrecise"))
-                if size is None:
-                    size = _num(pack.get("CapacitySize"))
-                used_v = _num(pack.get("CapacityUsedPrecise"))
-                if used_v is None:
-                    used_v = _num(pack.get("CapacityUsed"))
-
-            remaining += remain
-            total += size or 0
-            used += max(used_v or 0, 0)
-
-            if remain > 0:
-                usable += 1
-                cycle_end = str(pack.get("CycleEndTime") or "")
-                # 只关心「真的还有余额且最早到期」的包，用来提示何时该续
-                if cycle_end and (not soonest or cycle_end < soonest):
-                    soonest = cycle_end
-
-        return {
-            "remaining": round(remaining, 2),
-            "total": round(total, 2),
-            "used": round(used, 2),
-            "packs": active,
-            "usable_packs": usable,
-            "soonest_expire": soonest[:10] if soonest else "",
-        }
+        payload = resp.get("data") or resp.get("Data") or {}
+        if not isinstance(payload, dict):
+            logging.debug("workbuddy 余额: Response %s", payload)
+            return None
+        packs = payload.get("Accounts") or payload.get("accounts") or []
+        if not isinstance(packs, list):
+            return None
+        return _workbuddy_packs_balance(packs)
     except Exception as exc:  # noqa: BLE001
         logging.debug("workbuddy 余额查询失败: %s", exc)
         return None
 
 
-# ---------------------------------------------------------------------------
-# 华润通（微信版）
-# ---------------------------------------------------------------------------
+def fetch_workbuddy_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    """
+    查询 WorkBuddy(CodeBuddy) 积分余额（**全部账号**）
+
+    config/token.json 的 workbuddy.accounts 里可能配了多个账号。
+    2026-10-29 起逐个统计并在汇总推送里分条展示——此前只取第一个有
+    access_token 的账号，第二个账号（FantaSea）的余额完全看不到。
+
+    Returns:
+        Optional[Dict]: 汇总口径（各账号求和），额外带 `accounts` 列表，
+        每项含 account_name 及该账号的 remaining/total/used/packs/
+        usable_packs/soonest_expire。全部账号都查不到时返回 None。
+    """
+    config = _load_config()
+    accounts = [
+        a for a in ((config.get("workbuddy") or {}).get("accounts") or [])
+        if a.get("access_token")
+    ]
+    if not accounts:
+        return None
+
+    try:
+        WorkBuddyAPI = _load_platform_api("workbuddy").WorkBuddyAPI
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("workbuddy api 加载失败: %s", exc)
+        return None
+
+    per_account: list = []
+    for idx, account in enumerate(accounts):
+        info = _fetch_one_workbuddy(account, WorkBuddyAPI, timeout)
+        if not info:
+            continue
+        name = (account.get("account_name") or account.get("email")
+                or account.get("uid") or f"账号{idx + 1}")
+        info["account_name"] = name
+        per_account.append(info)
+
+    if not per_account:
+        return None
+
+    summed = {
+        "remaining": round(sum(i["remaining"] for i in per_account), 2),
+        "total": round(sum(i["total"] for i in per_account), 2),
+        "used": round(sum(i["used"] for i in per_account), 2),
+        "packs": sum(i["packs"] for i in per_account),
+        "usable_packs": sum(i["usable_packs"] for i in per_account),
+    }
+    expires = [i["soonest_expire"] for i in per_account if i.get("soonest_expire")]
+    summed["soonest_expire"] = min(expires) if expires else ""
+    summed["accounts"] = per_account
+    return summed
+
 
 def fetch_huaruntong_wx_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
     """
@@ -355,6 +411,50 @@ def fetch_huaruntong_wx_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict
         return None
 
 
+def fetch_modelscope_balance(timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    """
+    查询魔搭 ModelScope 魔粒余额
+
+    走 `GET /openapi/v1/magicubes/balance`（官方 OpenAPI，bearerAuth），
+    复用 `script/modelscope/api.py`。响应形如：
+        {"success":true,"data":{total_balance,available_balance,frozen_amount}}
+
+    ⚠️ 令牌门槛：魔搭令牌分「只读 / 下载 / 全部」三档，只有「全部」档能访问
+    魔粒接口，其余档会被拒；此时本函数返回 None（汇总里不显示，不影响签到）。
+
+    Returns:
+        Optional[Dict]: {'remaining','total','hold'}；失败返回 None
+    """
+    config = _load_config()
+    accounts = (config.get("modelscope") or {}).get("accounts") or []
+    account = next((a for a in accounts if a.get("token")), None)
+    if not account:
+        return None
+
+    try:
+        api_mod = _load_platform_api("modelscope")
+        api = api_mod.ModelScopeAPI(
+            token=account["token"],
+            site=account.get("site") or "cn",
+            account_name=account.get("account_name") or "",
+            proxy=account.get("proxy"),
+        )
+        wallet = api.balance()
+        available = _num(wallet.get("available"))
+        total_ = _num(wallet.get("total"))
+        frozen = _num(wallet.get("frozen"))
+        if available is None and total_ is None:
+            return None
+        return {
+            "remaining": available if available is not None else total_,
+            "total": total_ if total_ is not None else available,
+            "hold": frozen or 0,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("modelscope 余额查询失败: %s", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------------
@@ -363,6 +463,7 @@ BALANCE_FETCHERS = {
     "trae": fetch_trae_balance,
     "workbuddy": fetch_workbuddy_balance,
     "huaruntong_wx": fetch_huaruntong_wx_balance,
+    "modelscope": fetch_modelscope_balance,
 }
 
 
@@ -379,6 +480,14 @@ def format_balance_line(key: str, balance: Optional[Dict[str, Any]]) -> Optional
     if remaining is None:
         return None
 
+    if key == "modelscope":
+        # 魔粒当日发放当日有效（24 小时过期），余额与"今日到账"是两件事，
+        # 这里只报可用余额，避免误导成"攒着能用"。
+        text = f"💰 魔粒 {_fmt(remaining)}"
+        if balance.get("hold"):
+            text += f"（冻结 {_fmt(balance['hold'])}）"
+        return text
+
     if key == "trae":
         text = f"💰 余额 {_fmt(remaining)} / {_fmt(balance.get('total') or 0)} 积分"
         if balance.get("expire_at"):
@@ -386,10 +495,27 @@ def format_balance_line(key: str, balance: Optional[Dict[str, Any]]) -> Optional
         return text
 
     if key == "workbuddy":
+        # 多账号：分条列出各自余额，再给一行合计；
+        # 单账号时退化为原来的单行格式，不引入多余的「合计」字样。
+        accounts = balance.get("accounts") or []
+        if len(accounts) > 1:
+            parts = []
+            for a in accounts:
+                name = a.get("account_name") or "未命名"
+                if a.get("soonest_expire"):
+                    parts.append(
+                        f"{name} {_fmt(a.get('remaining') or 0)}"
+                        f"（至 {a['soonest_expire']}）"
+                    )
+                else:
+                    parts.append(f"{name} {_fmt(a.get('remaining') or 0)}")
+            text = "💰 " + " | ".join(parts)
+            text += f" ｜ 合计 {_fmt(remaining)}"
+            return text
+
         usable = balance.get("usable_packs")
         active = balance.get("packs", 0)
         if usable is not None and usable != active:
-            # 有「有效但额度已用尽」的包时，把两个数字都亮出来，避免误读
             packs_text = f"{usable}/{active} 个包有余额"
         else:
             packs_text = f"{active} 个有效包"
@@ -406,11 +532,14 @@ def format_balance_line(key: str, balance: Optional[Dict[str, Any]]) -> Optional
             text += f"（冻结 {_fmt(balance['hold'])}）"
         return text
 
-    return f"💰 余额 {_fmt(remaining)}"
+    text = f"💰 余额 {_fmt(remaining)}"
+    return text
 
 
 def collect_balances(platform_keys: list) -> Dict[str, Optional[Dict[str, Any]]]:
-    """并发查询多个平台余额；单个失败不影响其它"""
+    """
+    批量收集余额，供汇总推送使用。任何异常都返回 None，不向上抛。
+    """
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for key in platform_keys:
         fetcher = BALANCE_FETCHERS.get(key)
