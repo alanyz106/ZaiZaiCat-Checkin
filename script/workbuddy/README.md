@@ -137,10 +137,17 @@ python import_accounts.py --path "%LOCALAPPDATA%/CodeBuddyExtension/Data/Public/
 | `access_token` | 约 28 天 | 过期后用 `refresh_token` 换新 |
 | `refresh_token` | 约 30 天 | 刷新时随 `access_token` 一起换新，从刷新时刻重新计 30 天 |
 
-> 📌 **实测数据（2026-10-25 签发的令牌）**：`iat` = 10-25 10:10，
-> `access_token` `exp` = 11-22 10:10（28 天），`refresh_token` `exp` = 11-24 10:10（30 天）。
+> 📌 **实测数据**：
+> - 2026-10-25 签发：`iat` = 10-25 10:10，
+>   `access_token` `exp` = 11-22 10:10（28 天），`refresh_token` `exp` = 11-24 10:10（30 天）。
+> - 2026-10-29 签发（另一账号，`iss` = `www.workbuddy.cn`）：`iat` = 10-29 22:17，
+>   `access_token` `exp` = 11-26 22:17（28 天），`refresh_token` `exp` = 11-28 22:17（30 天）。
+>
 > 早期文档写的「60 天 / 90 天」与实测不符，此处已按实际值修正。
 > 若后续观察到服务端调整有效期，以真实 JWT 的 `exp - iat` 为准。
+>
+> ⚠️ 数据点均来自 `www.codebuddy.cn` / `www.workbuddy.cn` 的 `copilot` realm，
+> 两个域名共用同一套后端，签发规则一致（2026-10-29 实测两 host 对同一令牌均返回 `code:0`）。
 
 脚本在签到遇到令牌过期时会自动刷新并回写配置。**只要脚本每 30 天内至少成功运行一次，令牌即可无限续期**；连续 30 天未运行才需要重新导入账号。
 
